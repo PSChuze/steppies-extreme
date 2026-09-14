@@ -1,0 +1,117 @@
+# DDR Online server.
+#
+#   docker compose up -d
+#
+# That is the whole setup. No environment variables, no files to copy, no
+# configuration. State is kept in a named volume and survives restarts.
+#
+# Requires host networking, so this runs on Linux (including NAS boxes and
+# VMs). Docker Desktop on Windows and macOS does not give containers the real
+# source address of incoming packets, and STUN cannot work without it. On those
+# platforms, run the three scripts in server/ directly with Python instead;
+# they are standard library only.
+#
+# Point the DNS your console or emulator uses at this host, so that
+# dx2gate01.konamionline.com, dx2stun.konamionline.com and
+# ddrsnstun.konamionline.com resolve here. README.md has the details.
+#
+# Ports used:
+#   9573/tcp    Extreme 2 gate, account and lobby
+#   19573/tcp   SuperNOVA gate
+#   19570/tcp   SuperNOVA account and lobby
+#   3478/udp    STUN, plus 3479 for change-port requests
+#   19580/tcp   HTTP, SuperNOVA only
+#   19600-19615/udp  SuperNOVA match relay, two ports per match
+#
+# Override any of these on the command line if something else already has the
+# port, but keep 19580 in step with "web_port" in patches/patches.json: the
+# patched disc asks for that exact port and nothing answers on another one.
+
+services:
+  gate:
+    image: python:3.12-slim
+    container_name: ddr-gate
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    command:
+      - python3
+      - -u
+      - gate.py
+      - --host=0.0.0.0
+      - --port=9573
+      # SuperNOVA dials different ports for the same protocol. The service
+      # table at 0x002d013c packs both as u16. These get the full gate, not a
+      # placeholder.
+      - --also-listen=19573,19570
+      - --keyfile=/state/xorkey.bin
+      - --state-file=/state/state.json
+      - --reply-empty
+      # The server list handed to the client after the gate phase. It points
+      # back at this same host, because the gate deliberately hangs up and the
+      # account server is a second connection. The address defaults to whatever
+      # the client reached this server on, or for a client arriving from the
+      # internet through a port forward, the public address, looked up and kept
+      # current on its own. Nothing to configure either way.
+      - --serve-svrinfo
+      - --serve-svrlist
+      - --svr-name=DDR
+      - --svr-label=DDR
+      - --motd=DDR ONLINE
+      - --pair
+      - --serve-block
+      # Ranking Challenge songs are generated from the week and rotate on
+      # their own. Pinning --rc-first-song turns that off; it exists for
+      # testing. The generator never serves song id 8, which hangs the client.
+      - --serve-rc
+      - --sn-comp=open
+      - --sn-songs=online
+      # SuperNOVA plays matches peer to peer over UDP, which two consoles
+      # behind an emulator or a NAT cannot reach each other on. This relays
+      # it through the server instead. Extreme 2 does not need it: its
+      # match traffic already travels over the lobby connection.
+      - --udp-relay
+    volumes:
+      - ./server:/app:ro
+      - ddr-state:/state
+
+  stun:
+    image: python:3.12-slim
+    container_name: ddr-stun
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    command:
+      - python3
+      - -u
+      - stun.py
+      - --host=0.0.0.0
+      - --port=3478
+      - --alt-port=3479
+    volumes:
+      - ./server:/app:ro
+
+  # SuperNOVA only. Extreme 2 never makes an HTTP request.
+  #
+  # SuperNOVA fetches a user agreement, a privacy statement and a service
+  # information document after the gate and STUN phases, and refuses to
+  # continue without them. Account creation is also an HTTP POST rather than
+  # part of the gate protocol.
+  web:
+    image: python:3.12-slim
+    container_name: ddr-web
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    command:
+      - python3
+      - -u
+      - web.py
+      - --host=0.0.0.0
+      - --port=19580
+    volumes:
+      - ./server:/app:ro
+      - ddr-state:/state
+
+volumes:
+  ddr-state:

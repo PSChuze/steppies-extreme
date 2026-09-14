@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# GAME DATA -- NEVER COMMIT ANY OF THIS
+#
+# This repository contains only original work: the server, the analysis tools,
+# and documentation of what was found. It must never contain Konami's game data
+# or anything mechanically derived from it.
+#
+# That means no disc images, no files extracted from a disc, no Ghidra projects
+# (they embed the binaries), and no strings/disassembly dumps. Everything in
+# this block is either the retail game or a derivative of it.
+#
+# The patches under patches/ and tools/ describe *addresses and instructions*.
+# They contain no game code, and are applied by the user to their own disc.
+# ---------------------------------------------------------------------------
+Games/
+work/
+ghidra/
+out/
+patches/dist/
+*.iso
+*.ISO
+*.bin
+*.BIN
+*.img
+*.IMG
+*.elf
+SLUS_*
+
+# ---------------------------------------------------------------------------
+# Local state and secrets
+#
+# registrations.json holds account names and passwords posted by clients.
+# state.json holds account keys and player files. xorkey.bin is recovered at
+# runtime from the first client that connects.
+# ---------------------------------------------------------------------------
+logs/
+state/
+*.log
+state.json
+registrations.json
+results.json
+ddr.db
+ddr.db-wal
+ddr.db-shm
+content.json
+admin_token
+*.unreadable
+xorkey.bin
+selftest_key.bin
+hosts.ini
+
+# ---------------------------------------------------------------------------
+# Python / editor
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

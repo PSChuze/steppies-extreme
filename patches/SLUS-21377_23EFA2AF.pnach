@@ -1,0 +1,65 @@
+gametitle=Dance Dance Revolution SuperNOVA (USA) [SLUS-21377]
+comment=NO-OP, kept for the record. 0x0010ce60 is inside the boot-time IRX-load resident check for DNAS310.IMG, not the authentication -- the module is on the disc, so the spin exits either way. The real DNAS bypass is a 4-word patch to DATA03.BIN (net_mas4) state 10; see FACTS.md and tools/snisopatch.py. Do NOT pnach 0x00a46xxx: DATA03 and DATA04 share that slot.
+
+// SuperNOVA's DNAS is structured differently from Extreme 2's -- worth knowing,
+// because the Extreme 2 patch (E8FB7A7F.pnach, address 0x001d5280) does NOT
+// apply here and neither game's patch works on the other.
+//
+// At 0x00165780 SuperNOVA loads the module and then BUSY-WAITS:
+//
+//   00165798  lui   $a0, 0x2e
+//   0016579c  jal   0x00142ad0                 ; load "cdrom0:\IRX\DNAS310.IMG;1"
+//   001657a0  addiu $a0, $a0, 0x288e
+//   001657a4  jal   0x0010ce48                 ; <-- DNAS poll: 0 = busy, 1 = ok
+//   001657ac  addiu $v1, $zero, 1
+//   001657bc  bne   $v0, $v1, 0x001657a4       ; <-- spin until it returns 1
+//
+// That loop has no timeout and no error path, so with DNAS dead the title hangs
+// here and never reaches the gate lookup. Confirmed live from the prod resolver:
+// repeated `A gate1.us.dnas.playstation.org -> forwarded` and not one
+// konamionline.com query.
+//
+// The poll at 0x0010ce48 tests a status bit and, on success, does real setup
+// before returning 1:
+//
+//   0010ce50  jal   0x001039f0                 ; get status word (arg 4)
+//   0010ce58  lui   $v1, 4                     ; test bit 0x00040000
+//   0010ce60  beqz  $v0, 0x0010ce8c            ; bit clear -> return 0 (busy)
+//   0010ce64  move  $v0, $zero                 ;   (delay slot)
+//   0010ce68  jal   0x00103a60                 ; \
+//   0010ce74  jal   0x0010fa08 (1, 1)          ;  > success-path setup
+//   0010ce80  jal   0x0010fa08 (0, 1)          ; /
+//   0010ce88  addiu $v0, $zero, 1              ; return 1
+//
+// So we NOP the branch rather than stubbing the function. Execution then always
+// falls through to the success path, the three setup calls still happen, and the
+// function returns 1. Stubbing the entry with `jr $ra / li $v0,1` would also break
+// the spin loop but would SKIP that setup -- avoid it unless this misbehaves.
+//
+// The delay-slot `move $v0, $zero` still executes; harmless, 0x0010ce88
+// overwrites $v0 with 1 on the way out.
+
+// ── WHY THIS FILE HAS NO [Section] HEADER ────────────────────────────────────
+// It used to have one, and that is why the Deck still showed the DNAS error on
+// 2026-08-27 while Extreme 2 worked. A pnach whose patches sit under a `[Name]`
+// header is an individually-toggleable CHEAT, and a newly added one defaults to
+// DISABLED. PCSX2 logs "Found 1 cheats in ...pnach" either way, so the file
+// looks loaded while doing absolutely nothing. The Extreme 2 pnach was fixed for
+// exactly this on the same day; this one was written earlier and missed it.
+// An UNLABELED patch applies automatically.
+//
+// ── AND WHY `word`, NOT `extended` ───────────────────────────────────────────
+// `extended` is Action-Replay-style: the top nibble of the ADDRESS encodes the
+// write width, and `0010ce60` leads with `0`, which means an 8-BIT write. Only
+// the low byte of the value would land:
+//     original  0a 00 40 10   (0x1040000a  beqz $v0, 0x0010ce8c)
+//     extended  00 00 40 10   (0x10400000  beqz $v0, 0x0010ce64)
+// As it happens that is harmless here -- an offset of 0 branches into the delay
+// slot and falls through to the success path anyway -- but it is not the
+// instruction we asked for. `word` writes all four bytes and gives a real nop.
+// Verified against the ELF: 0x0010ce60 reads 0x1040000a.
+//
+// CRC verified by recomputing PCSX2's ElfObject::GetCRC (XOR of every LE u32)
+// over SLUS_213.77: 23EFA2AF. Filename must stay <serial>_<CRC>.pnach.
+
+patch=1,EE,0010ce60,word,00000000

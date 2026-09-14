@@ -1,0 +1,118 @@
+{
+  "_": [
+    "Single source of truth for every disc patch this project applies.",
+    "",
+    "Consumed by tools/isopatch.py (apply to your own disc) and tools/mkpatch.py",
+    "(build the .xdelta files for a release). Nothing here is game code: each edit",
+    "is an offset, the bytes expected to be there, and the bytes to write. Every",
+    "'expect' is verified against the source before anything is written.",
+    "",
+    "All edits are SIZE-NEUTRAL and applied in place, so the ISO9660 layout -- every",
+    "LBA the game hardcodes -- is untouched. A full rebuild would not guarantee that.",
+    "",
+    "'at' is a byte offset within the named file, not within the disc image.",
+    "For a PS2 main ELF, file offset = vaddr - 0x00100000 + 0x200."
+  ],
+
+  "web_port": 19580,
+
+  "games": {
+    "SLUS-21174": {
+      "title": "Dance Dance Revolution Extreme 2 (USA)",
+      "elf_crc": "E8FB7A7F",
+      "source": {
+        "sha1": "b2087cecb653aafdc09ba389169e8f25148f0d6c",
+        "size": 3917185024
+      },
+      "files": {
+        "SLUS_211.74": {
+          "size": 2183872,
+          "why": "DNAS bypass. Sony's DNAS servers are permanently offline, so the check can never pass. 0x001d5280 is the login-side DNAS wrapper; its caller only reads the return value (1 = ok / 0 = busy / -1 = error), so returning 1 immediately is sufficient. Patched here rather than at the poll (0x008685b0) because that address lives in the DATA07.BIN overlay, and vaddr 0x00850000 is an aliased slot shared by seven overlays. 0x001d5280 is inside PH0 (0x00100000-0x00764a00), always mapped.",
+          "edits": [
+            {
+              "kind": "word", "at": "0x0d5480", "va": "0x001d5280",
+              "expect": "27bdffe0", "replace": "03e00008",
+              "was": "addiu $sp, $sp, -0x20", "now": "jr    $ra"
+            },
+            {
+              "kind": "word", "at": "0x0d5484", "va": "0x001d5284",
+              "expect": "24020001", "replace": "24020001",
+              "was": "addiu $v0, $zero, 1", "now": "addiu $v0, $zero, 1",
+              "note": "Delay slot. Already holds the required instruction on the retail disc, so this edit writes nothing. Listed because the patch is only correct if this value is what is there."
+            }
+          ]
+        }
+      }
+    },
+
+    "SLUS-21377": {
+      "title": "Dance Dance Revolution SuperNOVA (USA)",
+      "elf_crc": "23EFA2AF",
+      "source": {
+        "sha1": "810d0b68b2fdbebf27cf80380f4427c63e712084",
+        "size": 1574731776
+      },
+      "files": {
+        "DATA03.BIN": {
+          "size": 173824,
+          "module": "net_mas4",
+          "load_vaddr": "0x00a46000",
+          "why": "DNAS2 bypass. DNAS2 is never defeated, only its verdict overridden: obj+0x58 == 5 ('Authenticated.') is the entire definition of 'DNAS passed', and it is read in exactly one place -- the DNAS scene's state-10 handler. This forces result type 5 without consulting the DNAS2 library, then lets the game's own code fall through to state 0x0b. This MUST be a file patch, not a pnach: 0x00a46000 is an overlay slot shared by DATA03 (net_mas4) and DATA04 (netlby_mas4), and a runtime patch there corrupts whichever module is resident.",
+          "edits": [
+            {
+              "kind": "word", "at": "0x000fc0", "va": "0x00a46fc0",
+              "expect": "0c2a2078", "replace": "24030005",
+              "was": "jal   0x00a881e0", "now": "addiu $v1, $zero, 5"
+            },
+            {
+              "kind": "word", "at": "0x000fc4", "va": "0x00a46fc4",
+              "expect": "26040058", "replace": "ae030058",
+              "was": "addiu $a0, $s0, 0x58", "now": "sw    $v1, 0x58($s0)"
+            },
+            {
+              "kind": "word", "at": "0x000fc8", "va": "0x00a46fc8",
+              "expect": "2403fff8", "replace": "00001021",
+              "was": "addiu $v1, $zero, -8", "now": "move  $v0, $zero"
+            },
+            {
+              "kind": "word", "at": "0x000fcc", "va": "0x00a46fcc",
+              "expect": "10430028", "replace": "00000000",
+              "was": "beq   $v0, $v1, 0xa47070", "now": "nop"
+            }
+          ]
+        },
+        "SLUS_213.77": {
+          "size": 2117048,
+          "why": "Repoint the service table's HTTP URLs at a port we can actually bind. The gate host already has 80/443/8080 taken, and DATA08's URL parser picks a default port by scheme then honours an explicit ':port' (0x00abed64 selects 0x50/0x1bb, 0x00abedac scans for ':'), so an explicit port is enough -- no code patch needed. Paths are shortened to make room, which is free because we serve them ourselves. Each replacement is NUL-padded out to the original slot.",
+          "edits": [
+            {
+              "kind": "cstr", "at": "0x1fbd80",
+              "expect": "https://dx2web.konamionline.com/ddrsn/reguser/reguser.html",
+              "replace": "http://dx2web.konamionline.com:{web_port}/ddrsn/reg/reg.html"
+            },
+            {
+              "kind": "cstr", "at": "0x1fbdbb",
+              "expect": "https://dx2web.konamionline.com/ddrsn/reguser/chgpswd.html",
+              "replace": "http://dx2web.konamionline.com:{web_port}/ddrsn/reg/chg.html"
+            },
+            {
+              "kind": "cstr", "at": "0x1fbdf6",
+              "expect": "http://dx2web.konamionline.com/ddrsn/oua/ddrsn_oua.txt",
+              "replace": "http://dx2web.konamionline.com:{web_port}/ddrsn/oua/oua.txt"
+            },
+            {
+              "kind": "cstr", "at": "0x1fbe2d",
+              "expect": "http://info.service.konamionline.com/VW335-U1/info/",
+              "replace": "http://info.service.konamionline.com:{web_port}/VW/info/"
+            },
+            {
+              "kind": "cstr", "at": "0x1fbe61",
+              "expect": "http://dx2web.konamionline.com/ddrsn/oua/ddrsn_pia.txt",
+              "replace": "http://dx2web.konamionline.com:{web_port}/ddrsn/oua/pia.txt"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

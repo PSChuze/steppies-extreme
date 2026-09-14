@@ -6,7 +6,7 @@ both services down years ago. This brings them back on a machine you control.
 | game | serial | state |
 |---|---|---|
 | Dance Dance Revolution Extreme 2 (USA) | SLUS-21174 | Playable. Login, lobby, head-to-head matches, Ranking Challenge, rankings and personal records. |
-| Dance Dance Revolution SuperNOVA (USA) | SLUS-21377 | Login through lobby. Account creation, dancer select, friends and the song list work. No matchmaking yet. |
+| Dance Dance Revolution SuperNOVA (USA) | SLUS-21377 | Playable. Account creation, matchmaking, chat, friends and tournaments work. |
 
 Everything was recovered from the retail discs and checked against a real
 client. Claims in the documentation carry the address or the wire trace they

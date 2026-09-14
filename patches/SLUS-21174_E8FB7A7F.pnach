@@ -1,0 +1,41 @@
+gametitle=Dance Dance Revolution Extreme 2 (USA) [SLUS-21174]
+comment=DNAS bypass. Sony's DNAS servers are permanently offline, so the check can never pass.
+
+// ── WHY THIS FILE HAS NO [Section] HEADER ────────────────────────────────────
+// A pnach whose patches sit under a `[Name]` header is an individually-toggleable
+// CHEAT, and a newly added one defaults to DISABLED -- PCSX2 logs
+// "Found 1 cheats in ...pnach" either way, so the file looks loaded while doing
+// nothing. Verified live via PINE: with a [DNAS Bypass] header, PCSX2 reported the
+// cheat found and 0x001d5280 still read 0x27bdffe0 (the original opcode).
+// An UNLABELED patch applies automatically. The working Dirge of Cerberus pnach in
+// this same folder is unlabeled for exactly this reason.
+//
+// ── NAMING ───────────────────────────────────────────────────────────────────
+// Must be <serial>_<CRC>.pnach. A bare <CRC>.pnach is the PCSX2 1.6 convention and
+// is ignored silently. CRC confirmed by PCSX2 itself:
+//   "ELF Loading: cdrom0:\SLUS_211.74;1, Game CRC = E8FB7A7F"
+//
+// ── WHAT IT DOES ─────────────────────────────────────────────────────────────
+// 0x001d5280 is the login-side DNAS wrapper (called from 0x001d4b60). It runs DNAS
+// init (0x00868800) and poll (0x008685b0) and returns 1 = ok / 0 = busy / -1 = err;
+// its caller only ever looks at that return value:
+//
+//   001d52c8  jal  0x00868800      ; DNAS init
+//   001d52e8  jal  0x008685b0      ; DNAS poll
+//   001d52f0  beqz $v0, done       ;   0 -> keep polling
+//   001d52f8  bne  $v0, 1, error   ; !=1 -> "login:dnas error"
+//                                  ;  =1 -> "login: dnas ok"
+//
+// So return 1 immediately:
+//   001d5280  jr    $ra
+//   001d5284  addiu $v0, $zero, 1    ; delay slot (already this value on disc)
+//
+// Patched here rather than at the poll (0x008685b0) because that address lives in
+// the DATA07.BIN overlay and vaddr 0x00850000 is an ALIASED slot shared by seven
+// overlays -- a per-frame write there would corrupt whichever is resident.
+// 0x001d5280 is inside PH0 (0x00100000-0x00764a00), always mapped.
+//
+// Place field is 1 = apply every frame, so it survives the overlay churn.
+
+patch=1,EE,001d5280,word,03e00008
+patch=1,EE,001d5284,word,24020001

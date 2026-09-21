@@ -151,7 +151,10 @@ def main():
                     help='what to advertise to clients arriving from the '
                          'internet: "auto" looks it up over STUN, "off" gives '
                          'them the local address, or a name or address to '
-                         'resolve (default: auto)')
+                         'resolve (default: auto). SET THIS when players reach '
+                         'you through a VPS, tunnel or proxy that keeps their '
+                         'source address: "auto" would put the address of the '
+                         'line this machine is on in every reply.')
     a = ap.parse_args()
 
     socks = {}

@@ -4681,7 +4681,11 @@ def main():
                          'the first time such a client connects and re-checks '
                          'it every few minutes, so a dynamic IP needs no '
                          'restart. "off" gives them the local address. '
-                         'Anything else is a name or address to resolve.')
+                         'Anything else is a name or address to resolve. '
+                         'SET THIS when players reach you through a VPS, tunnel '
+                         'or proxy that keeps their source address: "auto" '
+                         'would hand every one of them the address of the '
+                         'line this machine is on.')
     ap.add_argument('--svr-name', default='DDR', help='server name (max 64)')
     ap.add_argument('--motd', default='',
                     help='SvrInfo notification/MOTD text -- the 513-byte '

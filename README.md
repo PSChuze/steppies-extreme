@@ -74,6 +74,25 @@ restart. `--public-addr` on `gate.py` and `stun.py` changes where it comes from:
 `off`, or a name such as a dynamic DNS hostname. `--svr-addr` still overrides
 all of it, for every client.
 
+**If players reach you through another machine, set `--public-addr` yourself.**
+The automatic lookup finds the address of the line the server sits on. That is
+what you want behind an ordinary port forward. It is the wrong answer when
+players connect to a VPS, a tunnel or a reverse proxy that forwards to you and
+keeps each player's own source address: every one of them counts as "arriving
+from the internet", and every one of them is handed your home address, in the
+server list and in the STUN replies. If the point of the front machine was to
+keep that address private, the default defeats it. Give both programs the
+address players actually dial:
+
+```
+python3 server/gate.py --public-addr 203.0.113.10 ...
+python3 server/stun.py --public-addr 203.0.113.10 ...
+```
+
+To check it, send a STUN request to the public address from outside and look
+at SOURCE-ADDRESS and CHANGED-ADDRESS in the reply. Both must be the front
+machine's address.
+
 ### Ports
 
 | port | service | game |

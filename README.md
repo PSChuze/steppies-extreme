@@ -314,10 +314,11 @@ who is online to `live.json` in the state volume every five seconds, and
 
 ## OpenLobby admin panel
 
-The server can be run from an [OpenLobby](https://github.com/PrettyOpenLobby/OpenLobby)
-admin panel, beside any other games
-that panel looks after. The gate describes itself to the panel over a small HTTP port (`server/adminport.py`), so the
-panel needs no DDR code of its own. From the panel you get:
+The server can be run from an
+[OpenLobby](https://github.com/PrettyOpenLobby/OpenLobby) admin panel, beside
+any other games that panel looks after. The gate describes itself to the panel
+over a small HTTP port (`server/adminport.py`), so the panel needs no DDR code
+of its own. From the panel you get:
 
 - who is online, in which game and what they are doing, and the open
   tournaments and Ranking Challenge week;

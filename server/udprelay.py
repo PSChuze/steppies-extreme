@@ -51,15 +51,27 @@ class Pair(object):
     """One match's two ports, and where each side turned out to be."""
 
     __slots__ = ('a', 'b', 'sock_a', 'sock_b', 'seen_a', 'seen_b',
-                 'packets', 'opened')
+                 'packets', 'opened', 'allow_a', 'allow_b', 'dropped',
+                 'from_a', 'from_b', 'sent_a', 'sent_b')
 
     def __init__(self, a, b, sock_a, sock_b):
         self.a, self.b = a, b
         self.sock_a, self.sock_b = sock_a, sock_b
         self.seen_a = None          # console A's real source address
         self.seen_b = None
+        self.allow_a = None         # the only IP allowed to be A, if pinned
+        self.allow_b = None
+        self.dropped = 0
         self.packets = 0
         self.opened = time.time()
+        self.reset_counts()
+
+    def reset_counts(self):
+        # Received from each side, and forwarded to each side. A side that
+        # sends but is never sent to means the other console never spoke;
+        # a side that is sent to but never answers means our packets are not
+        # reaching it, which is the one failure the relay cannot see otherwise.
+        self.from_a = self.from_b = self.sent_a = self.sent_b = 0
 
     def __repr__(self):
         return ('<relay %d<->%d a=%s b=%s %d pkt>'
@@ -127,15 +139,27 @@ class Relay(object):
     def stop(self):
         self._stop.set()
 
-    def alloc(self):
-        """Take a pair for one match, or None if the pool is exhausted."""
+    def alloc(self, allow_a=None, allow_b=None):
+        """Take a pair for one match, or None if the pool is exhausted.
+
+        allow_a / allow_b pin each side to one IP address, the player's own,
+        which the gate knows from their TCP session. On a public server this
+        is what stops anyone who sprays the relay ports from taking over a
+        live match: without it the relay re-learns a side from whatever packet
+        arrived last, so a stranger's datagram would become "A" and receive
+        B's traffic. A console's UDP leaves from the same IP as its TCP
+        connection, NAT and PCSX2 included. None leaves a side open.
+        """
         with self._lock:
             if not self._free:
                 return None
             pair = self._free.pop(0)
         pair.seen_a = pair.seen_b = None
+        pair.allow_a, pair.allow_b = allow_a, allow_b
+        pair.dropped = 0
         pair.packets = 0
         pair.opened = time.time()
+        pair.reset_counts()
         return pair
 
     def release(self, pair):
@@ -143,7 +167,14 @@ class Relay(object):
             return
         with self._lock:
             if pair not in self._free:
+                self.log('relay %d<->%d closed after %ds: A %s sent %d, got %d;'
+                         ' B %s sent %d, got %d; %d dropped'
+                         % (pair.a, pair.b, time.time() - pair.opened,
+                            pair.seen_a, pair.from_a, pair.sent_a,
+                            pair.seen_b, pair.from_b, pair.sent_b,
+                            pair.dropped))
                 pair.seen_a = pair.seen_b = None
+                pair.allow_a = pair.allow_b = None
                 self._free.append(pair)
 
     def _pump(self):
@@ -165,21 +196,38 @@ class Relay(object):
                 # change source port mid-session, and the cost of trusting the
                 # latest source is one misdirected datagram in a protocol that
                 # is already lossy.
+                allow = pair.allow_a if side == 'a' else pair.allow_b
+                if allow is not None and src[0] != allow:
+                    # Not this side's player. Drop it, and say so once in a
+                    # while so a stranger on the port is visible in the log.
+                    pair.dropped += 1
+                    if pair.dropped in (1, 10, 100) or pair.dropped % 1000 == 0:
+                        self.log('relay %d: dropped %d packet(s) from %s:%d, '
+                                 'which is not %s'
+                                 % (pair.a if side == 'a' else pair.b,
+                                    pair.dropped, src[0], src[1], allow))
+                    continue
                 if side == 'a':
                     if pair.seen_a != src:
                         self.log('relay %d: A is %s:%d' % (pair.a, src[0], src[1]))
                     pair.seen_a = src
+                    pair.from_a += 1
                     out, dest = pair.sock_b, pair.seen_b
                 else:
                     if pair.seen_b != src:
                         self.log('relay %d: B is %s:%d' % (pair.b, src[0], src[1]))
                     pair.seen_b = src
+                    pair.from_b += 1
                     out, dest = pair.sock_a, pair.seen_a
                 if dest is None:
                     continue        # the other side has not spoken yet
                 try:
                     out.sendto(data, dest)
                     pair.packets += 1
+                    if side == 'a':
+                        pair.sent_b += 1
+                    else:
+                        pair.sent_a += 1
                 except OSError:
                     pass
 

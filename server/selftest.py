@@ -216,14 +216,18 @@ def test_sn_room_record():
     check('room song at +4', struct.unpack_from('>H', rec, 4)[0] == 74)
     check('room name at +10', rec[10:26] == b'aaa'.ljust(16, bytes(1)))
     check('room LISTED bit is set at +31', rec[31] & 1 == 1, rec[31])
-    # Two song fields: +4 feeds the availability filter, +32 is what the
-    # row DISPLAYS. Filling only the first drew the song as random.
     # Wire +34 bit 0 is the LOCK: set it and the client refuses the room
     # with "you cannot enter this room" (0x00a63c1c).
     check('room is NOT locked at +34', rec[34] & 1 == 0, rec[34])
-    check('room song is also at +32',
-          struct.unpack_from('>H', rec, 32)[0] == 74,
-          struct.unpack_from('>H', rec, 32)[0])
+    # Wire +32 is the owner's NAT WORD, not a second song field. The join
+    # handler refuses a row whose word 0x00277d70 cannot place, and every song
+    # id but a handful falls in that bucket -- so only rooms created on song
+    # 0 could be joined. 0 passes against every joiner code except 2.
+    for song in (0, 6, 11, 53, 90):
+        nat = struct.unpack_from('>H', gate.roomlist_entry_sn(
+            dict(r, song=song), 'x'), 32)[0]
+        check('room on song %d carries NAT word 0 at +32, not the song'
+              % song, nat == 0, nat)
     # f4 is a room SETTING, not a flag word. It was being ORed into the listed
     # byte on the theory that the creator's bits should survive; then a room
     # created with non-default options sent f4 = 4 (2026-09-14), which would
@@ -464,24 +468,173 @@ def test_public_address():
               host(session('8.8.8.8')) == '10.9.8.7')
         args.svr_addr = 'auto'
 
+        pins = []
         gate.RELAY = types.SimpleNamespace(
-            alloc=lambda: types.SimpleNamespace(a=19600, b=19601))
+            alloc=lambda *allow: pins.append(allow)
+            or types.SimpleNamespace(a=19600, b=19601))
 
-        def console(addr):
+        def console(dial, client):
             s = types.SimpleNamespace(args=args, relay_dial=None,
                                       relay_pair=None, log=lambda m: None,
-                                      who=lambda: '?')
-            s.advertised_host = lambda: addr
+                                      who=lambda: '?', addr=(client, 40000))
+            s.advertised_host = lambda: dial
             return s
 
-        near, far = console('192.168.1.2'), console('1.2.3.4')
+        near = console('192.168.1.2', '192.168.1.20')
+        far = console('1.2.3.4', '8.8.8.8')
         gate.Session.relay_link(near, far)
         check('relay: a LAN console and an internet one each get their own',
               near.relay_dial == ('192.168.1.2', 19600)
               and far.relay_dial == ('1.2.3.4', 19601),
               (near.relay_dial, far.relay_dial))
+        check('relay: each side is pinned to its own player\'s IP',
+              pins == [('192.168.1.20', '8.8.8.8')], pins)
     finally:
         gate.PUBLIC, gate.RELAY = saved
+
+    # The operator page shares the port SuperNOVA needs open to the internet.
+    import web
+    lan = types.SimpleNamespace(admin_from='lan')
+    check('web: /admin answers LAN, tailnet and loopback',
+          all(web.admin_allowed(ip, lan)
+              for ip in ('192.168.1.20', '100.64.0.37', '127.0.0.1')))
+    check('web: /admin refuses an internet address',
+          not web.admin_allowed('8.8.8.8', lan))
+    check('web: --admin-from any lets it through',
+          web.admin_allowed('8.8.8.8', types.SimpleNamespace(admin_from='any')))
+
+
+def test_sn2():
+    """SuperNOVA 2: its own ports, its own lobby, and the bodies that changed.
+
+    Every length here is the reader sequence tools/sndispmap.py prints for
+    SLUS_216.08. A short body is the failure that does not announce itself --
+    the parsers bounds-check the read cursor, not the message.
+    """
+    import types
+    args = types.SimpleNamespace(sn_ports={19573, 19570},
+                                 sn2_ports={29573, 29570},
+                                 sn_host_push=True, relay_addr=None,
+                                 svr_time=1791504000, sn_comp='open',
+                                 sn_comp_file='', sn_comp_future=0,
+                                 sn_comp_name='SN', sn_comp_songs=[0],
+                                 sn_comp_back=86400, sn_comp_ahead=86400)
+
+    def sess(port, pid, name):
+        s = gate.Session(None, ('192.0.2.1', 4000), args, {'key': None}, port)
+        s.player = {'id': pid, 'name': name, 'dancer': 5,
+                    'endpoint': {'public': '198.51.100.7', 'public_port': 6000,
+                                 'local': '10.0.0.7', 'local_port': 6001}}
+        return s
+
+    sn1, owner, guest = (sess(19570, 3, 'one'), sess(29570, 10, 'host'),
+                         sess(29570, 11, 'guest'))
+    check('29570 is SuperNOVA 2, and also SuperNOVA',
+          owner.is_sn2 and owner.is_sn)
+    check('19570 is SuperNOVA, not SuperNOVA 2',
+          sn1.is_sn and not sn1.is_sn2)
+    check('SuperNOVA 2 players share a lobby', owner.same_game(guest))
+    check('SuperNOVA and SuperNOVA 2 never meet',
+          not owner.same_game(sn1) and not sn1.same_game(owner))
+
+    def seq(r, sn2):
+        return gate.response_sequence(r, True, sn2)
+    check('SN2 0x4332 -> 0x4333', seq(0x4332, True) == ((0x4333,), True))
+    check('SN2 0x4312 -> 0x4313', seq(0x4312, True) == ((0x4313,), True))
+    check('SN2 0x4460 / 0x4470 are answered, not guessed',
+          seq(0x4460, True) == ((0x4461,), True)
+          and seq(0x4470, True) == ((0x4471,), True))
+    check('SN2 still has SuperNOVA\'s groups',
+          seq(0x4200, True) == ((0x4204, 0x4201, 0x4205), True))
+    check('SuperNOVA does not get the SN2 groups',
+          seq(0x4332, False) == ((0x4333,), False))
+    check('SN2 notifications are never answered',
+          not gate.SN2_NO_REPLY & (set(gate.REQUEST_RESPONSES)
+                                   | set(gate.REQUEST_RESPONSES_SN)
+                                   | set(gate.REQUEST_RESPONSES_SN2)))
+
+    m = gate.build_sn2_member_record(owner.player, 2, ready=1)
+    check('SN2 member record is 81 bytes', len(m) == 81, len(m))
+    check('SN2 member id at +0', struct.unpack_from('>i', m, 0)[0] == 10)
+    check('SN2 member name at +4', m[4:20] == b'host'.ljust(16, bytes(1)))
+    check('SN2 member slot and ready at +78/+79', m[78:80] == b'\x02\x01',
+          m[78:80].hex())
+    check('SN2 0x4325 record is 79 bytes',
+          len(gate.build_sn2_member_record(None, 1, flags=False)) == 79)
+    r = gate.build_sn2_member_record(owner.player, 0, ('203.0.113.9', 19600))
+    check('SN2 relayed member gives the relay in both pairs',
+          struct.unpack_from('>HH', r, 42) == (19600, 19600)
+          and r[46:62] == r[62:78] == b'203.0.113.9'.ljust(16, bytes(1)))
+
+    e = gate.roomlist_entry_sn2({'id': 10, 'song': 4}, 'host')
+    check('SN2 room list record is 37 bytes', len(e) == 37, len(e))
+    check('SN2 room list record extends SuperNOVA\'s',
+          e[:36] == gate.roomlist_entry_sn({'id': 10, 'song': 4}, 'host'))
+
+    owner.sn_room = {'id': 10, 'song': 74, 'f3': 1, 'f5': 2}
+    owner.peer, guest.peer = guest, owner
+    for who, w in (('guest', guest), ('owner', owner)):
+        body = w.payload_for(0x4333, 0x4332, b'')
+        check('SN2 0x4333 for the %s holds both players' % who,
+              len(body) == 38 + 2 * 81 and body[37] == 2, len(body))
+        check('SN2 0x4333 room is the owner\'s (+24)',
+              struct.unpack_from('>i', body, 24)[0] == 10)
+        check('SN2 0x4333 song at +28',
+              struct.unpack_from('>H', body, 28)[0] == 74)
+    check('SN2 0x4333 with no room is still well formed',
+          len(sess(29570, 12, 'x').payload_for(0x4333, 0x4332, b'')) == 38)
+
+    shapes = {0x4324: 4, 0x4393: 6, 0x4395: 9, 0x4391: 5, 0x4381: 8,
+              0x4431: 27, 0x4461: 9, 0x4471: 9}
+    for op, n in sorted(shapes.items()):
+        got = len(owner.payload_for(op, op - 1, b'\x00\x05'))
+        check('SN2 0x%04x body is %d bytes' % (op, n), got == n, got)
+    check('SN2 0x4393 echoes the song',
+          owner.payload_for(0x4393, 0x4392, b'\x00\x4a')[4:] == b'\x00\x4a')
+    check('SN2 ready push names the player who readied',
+          guest.sn_ready_body(1) == struct.pack('>iB', 11, 1))
+    check('SuperNOVA ready push is still one byte',
+          sn1.sn_ready_body(1) == b'\x01')
+    check('SN2 unlocks no songs (it has no online-only ones)',
+          owner.payload_for(0x8002) == b'')
+
+    # Tournaments: generated from the clock, in SuperNOVA 2's own id ranges
+    # and song table, and never SuperNOVA's.
+    import schedule
+    now = args.svr_time
+    auto = schedule.sn2_auto_competitions(now)
+    opened = [c for c in auto if c['start'] <= now < c['end']]
+    later = [c for c in auto if c['start'] > now]
+    check('SN2 has a weekly cup and a marathon open, and both next ones',
+          len(opened) == 2 and len(later) == 2, (len(opened), len(later)))
+    body = owner.payload_for(0x5032)
+    ids = [struct.unpack_from('>i', body, o)[0] for o in range(0, len(body), 50)]
+    check('SN2 0x5032 lists exactly the open ones',
+          len(body) % 50 == 0 and ids == [c['id'] for c in opened], ids)
+    check('SN2 0x5036 lists the upcoming ones',
+          [struct.unpack_from('>i', owner.payload_for(0x5036), o)[0]
+           for o in (0, 50)] == [c['id'] for c in later])
+    check('SN2 ids stay in their own range',
+          all(c['id'] >= schedule.SN2_WEEKLY_BASE for c in auto))
+    check('SuperNOVA still serves its own competition',
+          struct.unpack_from('>i', sn1.payload_for(0x5032), 0)[0] == 1)
+    cup = opened[0]
+    owner.sn_comp_sel = cup['id']
+    detail = owner.payload_for(0x5001)
+    songs = [struct.unpack_from('>H', detail, 61 + i * 13)[0] for i in range(10)]
+    check('SN2 0x5001 is 191 bytes with the cup songs, then empty stages',
+          len(detail) == 191 and songs[:5] == cup['songs']
+          and songs[5:] == [0xffff] * 5, songs)
+    check('SN2 tournament songs are in its 72-song table',
+          all(0 <= x < 72 for c in auto for x in c['songs']))
+
+    # 0x4404 reaches the opponent as 0x4405 with the sender's id in front.
+    sent = []
+    owner.push = lambda op, body: sent.append((op, body))
+    guest.relay_sn2_state(bytes.fromhex('0000000a01020003'))
+    check('SN2 0x4404 is relayed as 0x4405 with the sender id',
+          sent == [(0x4405, struct.pack('>i', 11)
+                    + bytes.fromhex('0000000a01020003'))], sent)
 
 
 def test_response_sequence():
@@ -638,6 +791,45 @@ def test_match_record():
               {'id': 1}, tail=(0, 0, gate.RC_SONG_IDS, 0)), 58)[0] == 0)
     check('0x44b0 mode outside 0..3 is clamped to 0',
           gate.build_match_record({'id': 1}, tail=(4, 0, 0, 0))[56] == 0)
+    check('0x44b0 own difficulty at +57, opponent\'s at +60',
+          tail[57] == 0x11 and tail[60] == 0x22, (tail[57], tail[60]))
+
+
+def test_x2_match_settings():
+    """Extreme 2 head-to-head: CreateRoom carries each player's win condition
+    and difficulty, and the match record must hand them back. Serving 0,0,0,0
+    made every match Light on one song (reported 2026-09)."""
+    import random as _r
+    room = lambda rule, diff: gate.parse_x2_createroom(
+        b'ddrex2'.ljust(32, b'\0') + bytes([rule, diff]))
+    check('X2 CreateRoom: +0x20 rule, +0x21 difficulty',
+          room(1, 2) == {'rule': 1, 'diff': 2}, room(1, 2))
+    check('X2 CreateRoom: short body is None',
+          gate.parse_x2_createroom(b'ddrex2') is None)
+    rng = _r.Random(7)
+    mode, song, a, b = gate.x2_match_settings(room(0, 1), room(0, 2), rng=rng)
+    check('X2 match: each player keeps their own difficulty',
+          (mode, a, b) == (0, 1, 2), (mode, a, b))
+    check('X2 match: song from the safe pool, never 8',
+          song in gate.RC_TESTED_SONG_IDS and song != 8, song)
+    songs = {gate.x2_match_settings(room(0, 0), room(0, 0), rng=rng)[1]
+             for _ in range(50)}
+    check('X2 match: the song varies between matches', len(songs) > 10,
+          len(songs))
+    check('X2 match: "any" difficulty takes the opponent\'s',
+          gate.x2_match_settings(room(0, 4), room(0, 2), rng=rng)[2:] == (2, 2))
+    check('X2 match: "any" against "any" is Standard, not Challenge',
+          gate.x2_match_settings(room(0, 4), room(0, 4), rng=rng)[2:] == (1, 1))
+    check('X2 match: "any" win condition takes the other side\'s',
+          gate.x2_match_settings(room(3, 0), room(2, 0), rng=rng)[0] == 2)
+    check('X2 match: "any" vs "any" draws only allowed conditions',
+          {gate.x2_match_settings(room(3, 0), room(3, 0), (1, 0, 0),
+                                  rng=rng)[0] for _ in range(20)} == {0})
+    check('X2 pairing: different win conditions are not paired',
+          not gate.x2_rules_compatible(room(0, 0), room(1, 0)))
+    check('X2 pairing: "any" pairs with anything',
+          gate.x2_rules_compatible(room(3, 0), room(1, 0))
+          and gate.x2_rules_compatible(None, room(2, 0)))
 
 
 def test_rc_info():
@@ -899,7 +1091,8 @@ def test_db_and_results():
 
     def mk(pid, name):
         f = types.SimpleNamespace(
-            args=args, is_sn=False, player={'id': pid, 'dancer': 18},
+            args=args, is_sn=False, is_sn2=False,
+            player={'id': pid, 'dancer': 18},
             rc_card=0, rc_songs={0: [61, 46, 31]}, rank_req=None, endgame=None,
             endgame_peer=None, peer=None, rc_try_req=b'')
         f.log = lambda *a: None
@@ -961,11 +1154,97 @@ def test_db_and_results():
         # Week numbers wrap: 60 weeks on, the same number is empty.
         check('week number reused a cycle later ignores old rows',
               results.rc_board(week, 0, now + RC_WEEK_SECONDS * 60) == [])
+
+        # SuperNOVA: the 0x4431 u8 is the verdict, 0 win / 1 lose / 2 draw.
+        # The first report is held and the second answers both.
+        x2_rows = len(db._h2h_rows(week, now + 9))
+        args.sn_endgame_wait = 0.2
+        c, e = mk(40, 'ALPHA'), mk(41, 'beta')
+        pushed = []
+        for f in (c, e):
+            f.is_sn, f.endgame_held, f.sn_verdict = True, False, 0
+            f.hold_sn_endgame = types.MethodType(gate.Session.hold_sn_endgame, f)
+            f.sn_endgame_timeout = types.MethodType(
+                gate.Session.sn_endgame_timeout, f)
+            f.push = lambda op, body, f=f: pushed.append((f.who(), op, body))
+        c.peer, e.peer = e, c
+        eg = lambda score: struct.pack('>iHIH', score, 0, 12633, 0) + bytes(24)
+        check('SN endgame: first report is held', c.hold_sn_endgame(eg(2338129)))
+        check('SN endgame: second report is answered at once',
+              not e.hold_sn_endgame(eg(8940217)))
+        check('SN endgame: higher score is told WIN (0)', e.sn_verdict == 0)
+        check('SN endgame: the held side is told LOSE (1)',
+              pushed == [('ALPHA', 0x4431, struct.pack('>IB', 0, 1))],
+              pushed)
+        check('SN results are kept apart from Extreme 2',
+              len(db._h2h_rows(week, now + 9)) == x2_rows
+              and len(db._h2h_rows(week, now + 9, 'sn')) == 1)
+        check('SN tally: beta 1 win, ALPHA 1 loss',
+              db.h2h_tally(week, now + 9, 'sn')[41]['win'] == 1
+              and db.h2h_tally(week, now + 9, 'sn')[40]['loss'] == 1)
+        # Equal scores draw, and 2 is the draw value.
+        del pushed[:]
+        c.hold_sn_endgame(eg(5000000))
+        e.hold_sn_endgame(eg(5000000))
+        check('SN endgame: equal scores are a draw (2) for both',
+              e.sn_verdict == 2 and pushed[0][2][4] == 2, (e.sn_verdict, pushed))
+        # An opponent that never reports: the held side is told it won.
+        del pushed[:]
+        e.sn_verdict = 0
+        check('SN endgame: held while the opponent is still playing',
+              c.hold_sn_endgame(eg(7000000)))
+        time.sleep(0.5)
+        check('SN endgame: timeout answers with a win',
+              pushed == [('ALPHA', 0x4431, struct.pack('>IB', 0, 0))]
+              and not c.endgame_held, pushed)
+        # The reply body carries whatever the pairing decided, then resets.
+        e.sn_verdict = 1
+        e.payload_for = types.MethodType(gate.Session.payload_for, e)
+        check('SN 0x4431 body carries the verdict',
+              e.payload_for(0x4431, 0x4430, eg(1)) == struct.pack('>IB', 0, 1)
+              and e.sn_verdict == 0)
+        # The ranking board serves those results: beta won one and drew one.
+        e.sn_ranking_body = types.MethodType(gate.Session.sn_ranking_body, e)
+        body = e.sn_ranking_body([])
+        check('SN board: two 45-byte rows, the winner first',
+              len(body) == 90 and body[8:12] == b'beta', body[:30])
+        tail = struct.unpack_from('>5i', body, 25)
+        want = {'points': 4, 'win': 1, 'draw': 1, 'loss': 0}
+        check('SN board row: points then the three counters',
+              tail == (4,) + tuple(want[k] for k in gate.SN_RANK_COUNTERS)
+              + (0,), tail)
     finally:
         (gate.LOBBY.discard if isinstance(gate.LOBBY, set)
          else gate.LOBBY.remove)(a)
         (gate.LOBBY.discard if isinstance(gate.LOBBY, set)
          else gate.LOBBY.remove)(b)
+        db.close()
+
+
+def test_h2h_game_migration():
+    """A database made before h2h_results had a `game` column gains one, and
+    the rows already there count as Extreme 2."""
+    import sqlite3
+    import db
+    d = tempfile.mkdtemp()
+    con = sqlite3.connect(os.path.join(d, 'ddr.db'))
+    con.execute('CREATE TABLE h2h_results (t INTEGER, week INTEGER, '
+                'a_player INTEGER, a_name TEXT, a_dancer INTEGER, '
+                'a_score INTEGER, b_player INTEGER, b_name TEXT, '
+                'b_dancer INTEGER, b_score INTEGER)')
+    con.execute('INSERT INTO h2h_results VALUES (1,0,1,"a",0,10,2,"b",0,5)')
+    con.commit()
+    con.close()
+    db.close()
+    db.setup(d)
+    try:
+        check('migration: old h2h rows are Extreme 2',
+              len(db._h2h_rows(0, 2)) == 1 and not db._h2h_rows(0, 2, 'sn'))
+        db.record_h2h(0, {'player': 3, 'score': 1}, {'player': 4, 'score': 2},
+                      now=3, game='sn')
+        check('migration: SN rows insert after it',
+              len(db._h2h_rows(0, 4, 'sn')) == 1)
+    finally:
         db.close()
 
 
@@ -988,6 +1267,15 @@ def test_credentials_and_sn_comp():
     results.credential_set('cafe', '3333', source='register')
     check('credential_set (register/change) replaces it',
           results.credential_verify('cafe', '3333') == 'ok')
+
+    # The account-key bypass: a different full username sharing the first 8
+    # bytes (the account key) must NOT get into the first one's account.
+    check('account first claim recorded',
+          results.account_claim('deadbeefdeadbeef', 'aaaa_victim') == 'first')
+    check('same owner ok',
+          results.account_claim('deadbeefdeadbeef', 'aaaa_victim') == 'ok')
+    check('different username, same 8-byte key, is rejected',
+          results.account_claim('deadbeefdeadbeef', 'aaaa_attacker') == 'mismatch')
 
     results.sn_comp_record(1, 12, 'Zed', 1, 50000)
     results.sn_comp_record(1, 12, 'Zed', 1, 48906)   # worse, ignored
@@ -1014,6 +1302,150 @@ def test_credentials_and_sn_comp():
     db.close()
 
 
+def test_admin_port():
+    """The OpenLobby admin port: module, status, calendar, search, the two
+    actions and the tournament editor, against a fake lobby."""
+    import types
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    import adminport
+    import content
+    import db
+    d = tempfile.mkdtemp()
+    db.close()
+    db.setup(d)
+    content.DEFAULT_PATH = os.path.join(d, 'content.json')
+    old = (gate.STATE_PATH, dict(gate.STATE), list(gate.LOBBY))
+    gate.STATE_PATH = os.path.join(d, 'state.json')
+    gate.STATE.clear()
+    gate.STATE.update({'next_id': 3, 'accounts': {
+        'aabbccddeeff0011': {'player_files': [
+            {'slot': 0, 'id': 1, 'name': 'ALPHA', 'dancer': 0}]},
+        '1122334455667788': {'player_files': [
+            {'slot': 0, 'id': 2, 'name': 'BETA', 'dancer': 0}]}}})
+    pushed, closed = [], []
+
+    def fake(pid, name, sn):
+        return types.SimpleNamespace(
+            is_sn=sn, is_sn2=False, player={'id': pid, 'name': name},
+            peer=None, start_sent=False, in_room=False, sn_room=None,
+            sn_searching=False, who=lambda: name,
+            push=lambda op, body: pushed.append((name, op, body)),
+            conn=types.SimpleNamespace(shutdown=lambda how: closed.append(name)))
+    gate.LOBBY[:] = [fake(1, 'ALPHA', True), fake(2, 'BETA', False)]
+    args = types.SimpleNamespace(
+        sn_comp='open', sn_comp_name='SN', sn_comp_songs=[0],
+        sn_comp_back=86400, sn_comp_ahead=86400, sn_comp_future=0,
+        sn_comp_file='', sn2_comp='auto')
+    srv = adminport.serve(adminport.Hooks(gate, args), '127.0.0.1', 0, 'tok',
+                          log=lambda m: None)
+    base = 'http://127.0.0.1:%d' % srv.server_address[1]
+
+    def call(path, body=None, token='tok', form=False):
+        data = None
+        if body is not None:
+            data = (urllib.parse.urlencode(body) if form
+                    else json.dumps(body)).encode()
+        req = urllib.request.Request(base + path, data=data,
+                                     headers={'X-Devtool-Token': token,
+                                              'X-Devtool-Actor': 'tester'})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def get(path, body=None):
+        return json.loads(call(path, body)[1])
+
+    try:
+        check('admin: a wrong token is refused',
+              call('/openlobby/module.json', token='nope')[0] == 403)
+        m = get('/openlobby/module.json')
+        check('admin: module names the game and both action kinds',
+              m['key'] == 'ddr' and m['players'] and m['calendar']
+              and {a['kind'] for a in m['actions']} == {'announce', 'kick'})
+        st = get('/openlobby/status.json')
+        check('admin: status counts both players and lists events',
+              st['online'] == 2 and any('Ranking Challenge' in r['name']
+                                        for r in st['rooms']), st['summary'])
+        found = get('/openlobby/players.json?q=alp&limit=5')['players']
+        check('admin: player search finds by name, marks online',
+              [(p['label'], p['online']) for p in found] == [('ALPHA', True)])
+        check('admin: player search limit is checked',
+              call('/openlobby/players.json?limit=99')[0] == 400)
+        now = int(time.time())
+        cal = get('/openlobby/calendar.json?from=%d&to=%d'
+                  % (now, now + 86400))['events']
+        check('admin: calendar has this RC week and the SN tournament',
+              any(e['id'].startswith('e2-rc-') for e in cal)
+              and any(e['id'] == 'sn-comp-1' for e in cal),
+              [e['id'] for e in cal])
+        links = json.dumps({'ddr': [{'key': 'aabbccddeeff0011' + '22' * 4,
+                                     'name': 'ALPHA'}]})
+        who = get('/openlobby/player.json?links=' + urllib.parse.quote(links))
+        check('admin: player lookup follows a proved login only',
+              [c['name'] for c in who.get('characters', [])] == ['ALPHA'])
+        check('admin: no links, no player',
+              get('/openlobby/player.json?handles=ALPHA') == {})
+        r = get('/openlobby/actions/announce',
+                {'text': 'Maintenance in ten minutes. Please finish your '
+                         'match and log out.'})
+        check('admin: announce reaches SuperNOVA chat, not Extreme 2',
+              r['ok'] and len(pushed) == 2
+              and all(n == 'ALPHA' and op == 0x4513 for n, op, _ in pushed),
+              r['msg'])
+        check('admin: announce lines stay short',
+              all(len(b) <= 29 + adminport.ANNOUNCE_WIDTH + 1
+                  for _, _, b in pushed))
+        r = get('/openlobby/actions/disconnect', {'polid': 'x',
+                                                  'handles': 'beta'})
+        check('admin: kick by handle closes that connection only',
+              r['ok'] and closed == ['BETA'], closed)
+        day = time.strftime('%Y-%m-%d', time.gmtime(now))
+        code, _ = call('/tournaments', {'do': 'add', 'game': 'sn',
+                                        'name': 'spring cup', 'songs': '3, 4',
+                                        'start': day, 'days': '7',
+                                        'difficulty': '2'}, form=True)
+        comps = gate.sn_competitions(args, now)
+        check('admin: adding a tournament keeps the running one',
+              code == 200 and [c['id'] for c in comps] == [1, 2]
+              and comps[1]['name'] == 'SPRING CUP'
+              and comps[1]['songs'] == [3, 4], comps)
+        call('/tournaments', {'do': 'reset', 'game': 'sn'}, form=True)
+        check('admin: going back to generated removes the file',
+              [c['id'] for c in gate.sn_competitions(args, now)] == [1])
+        call('/content', {'do': 'news', 'title': 'Hello', 'body': 'Hi'},
+             form=True)
+        check('admin: news is saved to content.json',
+              content.load()['news'][0]['title'] == 'Hello')
+        call('/content', {'do': 'rc', 'songs0': '8, 9, 10'}, form=True)
+        check('admin: the RC override drops the song that hangs the game',
+              content.load()['rc']['songs'] == {'0': [9, 10]})
+        code, page = call('/rankings')
+        check('admin: rankings page renders',
+              code == 200 and b'Ranking Challenge' in page)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        gate.STATE_PATH = old[0]
+        gate.STATE.clear()
+        gate.STATE.update(old[1])
+        gate.LOBBY[:] = old[2]
+        content.DEFAULT_PATH = '/state/content.json'
+
+
+def test_login_key_check():
+    """ddrlink only accepts the real key, which it can tell without holding
+    it: E(8 zero bytes) has a known answer."""
+    import ddrlink
+    check('ddrlink: a wrong key is refused', not ddrlink.key_ok(bytes(56)))
+    check('ddrlink: Blowfish matches the published test vector',
+          ddrlink.Blowfish(bytes(8)).encrypt(bytes(8)).hex()
+          == '4ef997456198dd78')
+
+
 if __name__ == '__main__':
     test_roundtrip()
     test_key_recovery()
@@ -1030,9 +1462,11 @@ if __name__ == '__main__':
     test_public_address()
     test_sn_competition_shapes()
     test_sn_ranking_row()
+    test_sn2()
     test_response_sequence()
     test_svrinfo_record()
     test_match_record()
+    test_x2_match_settings()
     test_stat_records()
     test_log_records()
     test_ranking_record()
@@ -1044,8 +1478,11 @@ if __name__ == '__main__':
     test_sn_rule_mask()
     test_peer_channel_not_answered()
     test_db_and_results()
+    test_h2h_game_migration()
     test_credentials_and_sn_comp()
     test_live_socket()
+    test_admin_port()
+    test_login_key_check()
     print()
     if FAILS:
         print('%d FAILED: %s' % (len(FAILS), ', '.join(FAILS)))

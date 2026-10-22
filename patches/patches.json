@@ -57,7 +57,7 @@
           "size": 173824,
           "module": "net_mas4",
           "load_vaddr": "0x00a46000",
-          "why": "DNAS2 bypass. DNAS2 is never defeated, only its verdict overridden: obj+0x58 == 5 ('Authenticated.') is the entire definition of 'DNAS passed', and it is read in exactly one place -- the DNAS scene's state-10 handler. This forces result type 5 without consulting the DNAS2 library, then lets the game's own code fall through to state 0x0b. This MUST be a file patch, not a pnach: 0x00a46000 is an overlay slot shared by DATA03 (net_mas4) and DATA04 (netlby_mas4), and a runtime patch there corrupts whichever module is resident.",
+          "why": "DNAS2 bypass. DNAS2 is never defeated, only its verdict overridden: obj+0x58 == 5 ('Authenticated.') is the entire definition of 'DNAS passed', and it is read in exactly one place -- the DNAS scene's state-10 handler. This forces result type 5 without consulting the DNAS2 library, then lets the game's own code fall through to state 0x0b. This MUST be a file patch, not a pnach: 0x00a46000 is an overlay slot that nine modules take turns in -- the boot ELF maps nine program headers there, DATA03 (net_mas4) and DATA04 (netlby_mas4) among them -- and an unconditional runtime patch corrupts whichever one is resident. A cheat engine that can test memory before writing is a different matter; see docs/cheats.md.",
           "edits": [
             {
               "kind": "word", "at": "0x000fc0", "va": "0x00a46fc0",
@@ -83,7 +83,7 @@
         },
         "SLUS_213.77": {
           "size": 2117048,
-          "why": "Repoint the service table's HTTP URLs at a port we can actually bind. The gate host already has 80/443/8080 taken, and DATA08's URL parser picks a default port by scheme then honours an explicit ':port' (0x00abed64 selects 0x50/0x1bb, 0x00abedac scans for ':'), so an explicit port is enough -- no code patch needed. Paths are shortened to make room, which is free because we serve them ourselves. Each replacement is NUL-padded out to the original slot.",
+          "why": "Repoint the service table's HTTP URLs at a port of our own, so the server does not need 80 or 443, which a home machine often has in use. DATA08's URL parser picks a default port by scheme then honours an explicit ':port' (0x00abed64 selects 0x50/0x1bb, 0x00abedac scans for ':'), so an explicit port is enough -- no code patch needed. Paths are shortened to make room, which is free because we serve them ourselves. Each replacement is NUL-padded out to the original slot.",
           "edits": [
             {
               "kind": "cstr", "at": "0x1fbd80",
@@ -109,6 +109,76 @@
               "kind": "cstr", "at": "0x1fbe61",
               "expect": "http://dx2web.konamionline.com/ddrsn/oua/ddrsn_pia.txt",
               "replace": "http://dx2web.konamionline.com:{web_port}/ddrsn/oua/pia.txt"
+            }
+          ]
+        }
+      }
+    },
+
+    "SLUS-21608": {
+      "title": "Dance Dance Revolution SuperNOVA 2 (USA)",
+      "elf_crc": "E2EF3D68",
+      "source": {
+        "sha1": "b2036b059c4a283a6bff2413c23e0901ec3070ea",
+        "size": 1317699584
+      },
+      "files": {
+        "DATA03.BIN": {
+          "size": 182144,
+          "module": "net_rel4",
+          "load_vaddr": "0x00976000",
+          "why": "DNAS2 bypass, the same override as SuperNOVA's: force obj+0x58 = 5 ('Authenticated.') instead of asking the DNAS2 library, then let the game's own code take the success path to state 0x0b. Same function, same library (DATA07 net_dnas is unchanged but for its relocation), rebuilt at a new base. The one difference is that SuperNOVA 2 inlines the -8 error path where SuperNOVA branched to it, so the compare after the call is a bne over that block rather than a beq into it; the patch turns it into an unconditional branch to the success path. A file patch for the same reason as SuperNOVA's: 0x00976000 is an overlay slot shared by DATA03 (net_rel4) and DATA04 (netlby_rel4).",
+          "edits": [
+            {
+              "kind": "word", "at": "0x000fb0", "va": "0x00976fb0",
+              "expect": "0c26e078", "replace": "24030005",
+              "was": "jal   0x009b81e0", "now": "addiu $v1, $zero, 5"
+            },
+            {
+              "kind": "word", "at": "0x000fb4", "va": "0x00976fb4",
+              "expect": "26040058", "replace": "ae030058",
+              "was": "addiu $a0, $s0, 0x58", "now": "sw    $v1, 0x58($s0)"
+            },
+            {
+              "kind": "word", "at": "0x000fb8", "va": "0x00976fb8",
+              "expect": "2403fff8", "replace": "00001021",
+              "was": "addiu $v1, $zero, -8", "now": "move  $v0, $zero"
+            },
+            {
+              "kind": "word", "at": "0x000fbc", "va": "0x00976fbc",
+              "expect": "14430006", "replace": "10000006",
+              "was": "bne   $v0, $v1, 0x00976fd8", "now": "b     0x00976fd8"
+            }
+          ]
+        },
+        "SLUS_216.08": {
+          "size": 2324024,
+          "why": "Repoint the service table's HTTP URLs at web_port, as for SuperNOVA. SuperNOVA 2 moved its host to www.ddr.konamionline.com and its paths under /ddrsn2/; the paths are shortened to /ddrsn2/reg/ and /V2/info/ so they fit their slots and do not collide with SuperNOVA's on the shared web service. Its gate (game.ddr.konamionline.com, 29573/29570) and STUN host (ddrsnstun) need no patch.",
+          "edits": [
+            {
+              "kind": "cstr", "at": "0x22e0f8",
+              "expect": "https://www.ddr.konamionline.com/ddrsn2/reguser/reguser.php",
+              "replace": "http://www.ddr.konamionline.com:{web_port}/ddrsn2/reg/reg.html"
+            },
+            {
+              "kind": "cstr", "at": "0x22e134",
+              "expect": "https://www.ddr.konamionline.com/ddrsn2/reguser/chgpswd.php",
+              "replace": "http://www.ddr.konamionline.com:{web_port}/ddrsn2/reg/chg.html"
+            },
+            {
+              "kind": "cstr", "at": "0x22e170",
+              "expect": "http://www.ddr.konamionline.com/ddrsn2/oua/ddrsn_oua.txt",
+              "replace": "http://www.ddr.konamionline.com:{web_port}/ddrsn2/oua/oua.txt"
+            },
+            {
+              "kind": "cstr", "at": "0x22e1a9",
+              "expect": "http://info.service.konamionline.com/VW350-U1/info/",
+              "replace": "http://info.service.konamionline.com:{web_port}/V2/info/"
+            },
+            {
+              "kind": "cstr", "at": "0x22e1dd",
+              "expect": "http://www.ddr.konamionline.com/ddrsn2/oua/ddrsn_pia.txt",
+              "replace": "http://www.ddr.konamionline.com:{web_port}/ddrsn2/oua/pia.txt"
             }
           ]
         }

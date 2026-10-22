@@ -34,16 +34,17 @@ DEFAULT_PATH = '/state/content.json'
 _lock = threading.Lock()
 _cache = {'path': None, 'mtime': None, 'data': {}}
 
-EMPTY = {'news': [], 'rc': None}
+EMPTY = {'news': [], 'rc': None, 'info': []}
 
 
-def load(path=DEFAULT_PATH):
+def load(path=None):
     """Current content, or EMPTY if there is no file or it is unreadable.
 
     A broken file must never take the server down: an operator editing JSON by
     hand at 2am should get their old content back and a log line, not a dead
     lobby. The caller decides whether to complain.
     """
+    path = path or DEFAULT_PATH
     try:
         mtime = os.path.getmtime(path)
     except OSError:
@@ -66,13 +67,18 @@ def load(path=DEFAULT_PATH):
     rc = data.get('rc')
     if isinstance(rc, dict):
         out['rc'] = rc
+    info = data.get('info')
+    if isinstance(info, list):
+        out['info'] = [n for n in info
+                       if isinstance(n, dict) and n.get('title')]
     with _lock:
         _cache.update(path=path, mtime=mtime, data=out)
     return out
 
 
-def save(data, path=DEFAULT_PATH):
+def save(data, path=None):
     """Write content atomically, so a reader never sees a half-written file."""
+    path = path or DEFAULT_PATH
     tmp = path + '.tmp'
     d = os.path.dirname(path)
     if d:
@@ -86,11 +92,12 @@ def save(data, path=DEFAULT_PATH):
         _cache.update(path=None, mtime=None, data={})
 
 
-def rc_override(week, challenge, path=DEFAULT_PATH):
+def rc_override(week, challenge, path=None):
     """Operator overrides for one challenge, as (songs, difficulty, stages).
 
     Any element may be None, meaning "use the generated value".
     """
+    path = path or DEFAULT_PATH
     rc = load(path).get('rc') or {}
     songs = None
     table = rc.get('songs')

@@ -229,7 +229,13 @@ def main():
     print()
     print('push -> event flag -> where %s reads it' % os.path.basename(lby))
     print('=' * 78)
-    readers = scan_flag_bytes(lby, 0, 0xa46000)
+    # The overlay header records its own load base at +0x08 (0x00a46000 for
+    # SuperNOVA's netlby_mas4, 0x00976000 for SuperNOVA 2's netlby_rel4).
+    # The flag range is SuperNOVA's: SuperNOVA 2 keeps room state in the
+    # room object instead, so expect this half to come out mostly empty there.
+    with open(lby, 'rb') as fh:
+        base = struct.unpack('<I', fh.read(0x0c)[8:])[0]
+    readers = scan_flag_bytes(lby, 0, base)
     for field in range(FLAG_LO, FLAG_HI + 1):
         if field not in setters and field not in readers:
             continue

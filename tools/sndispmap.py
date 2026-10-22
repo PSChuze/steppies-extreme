@@ -34,11 +34,11 @@ FO, VB = 0x280, 0x100000
 d = open(PATH, 'rb').read()
 md = Cs(CS_ARCH_MIPS, CS_MODE_MIPS64 + CS_MODE_LITTLE_ENDIAN)
 
-# The field codec, 0x00279a60-0x0027a300. **Several of these are duplicated**:
-# the compiler emitted two identical copies of the u16 reader and two of the
-# u8 reader, and a table that knows only one copy of each silently drops every
-# field read through the other -- which makes the reported body SHORT, and a
-# short body is the failure this whole tool exists to prevent.
+# The field codec. **Several of these are duplicated**: the compiler emitted
+# two identical copies of the u16 reader and two of the u8 reader, and a table
+# that knows only one copy of each silently drops every field read through the
+# other -- which makes the reported body SHORT, and a short body is the failure
+# this whole tool exists to prevent.
 #
 #   0x279d30 == 0x279d80  byte-identical, and BOTH are big-endian:
 #                         lb hi@+0x40 ; lbu lo@+0x41 ; sll 8 ; or
@@ -50,13 +50,31 @@ md = Cs(CS_ARCH_MIPS, CS_MODE_MIPS64 + CS_MODE_LITTLE_ENDIAN)
 #
 # Verified 2026-09-13 by fingerprinting every function in the codec region that
 # opens by loading the cursor at msg+0x454; those four are the only duplicates.
-READERS = {
-    0x279c70: 'u32', 0x279b90: 's32', 0x279b10: 'str',
-    0x279d30: 'u16', 0x279d80: 'u16',        # same function, both big-endian
-    0x279dd0: 'u8', 0x279e10: 'u8',          # same function
-    0x279a90: 'cstr', 0x279a60: 'more?',
-    0x271530: 'STATUS(u32)',
+#
+# SuperNOVA 2 has the same codec, function for function and in the same order,
+# rebuilt with different instruction scheduling, so the bytes do not match and
+# the addresses had to be paired by behaviour. Its parsers are laid out the
+# same way too, so only the addresses differ. Selected by executable size.
+PROFILES = {
+    2117048: dict(               # SLUS_213.77, SuperNOVA
+        readers={0x279c70: 'u32', 0x279b90: 's32', 0x279b10: 'str',
+                 0x279d30: 'u16', 0x279d80: 'u16',
+                 0x279dd0: 'u8', 0x279e10: 'u8',
+                 0x279a90: 'cstr', 0x279a60: 'more?',
+                 0x271530: 'STATUS(u32)'},
+        chain=(0x00271700, 0x00273500), parsers=(0x00269000, 0x00274000)),
+    2324024: dict(               # SLUS_216.08, SuperNOVA 2
+        readers={0x27afa0: 'u32', 0x27aec0: 's32', 0x27ae40: 'str',
+                 0x27b070: 'u16', 0x27b0c0: 'u16',
+                 0x27b110: 'u8', 0x27b150: 'u8',
+                 0x27adc0: 'cstr', 0x27ad80: 'more?',
+                 0x2726d0: 'STATUS(u32)'},
+        chain=(0x00272740, 0x00274440), parsers=(0x00269000, 0x00275000)),
 }
+if len(d) not in PROFILES:
+    sys.exit('%s: %d bytes, not a known SuperNOVA executable' % (PATH, len(d)))
+PROFILE = PROFILES[len(d)]
+READERS = PROFILE['readers']
 SIZE = {'u32': 4, 's32': 4, 'u16': 2, 'u16b': 2, 'u8': 1, 'STATUS(u32)': 4}
 
 
@@ -134,6 +152,20 @@ def scan_parser(pa, own):
                     brs, brt = (nxt >> 21) & 0x1f, (nxt >> 16) & 0x1f
                     if infl_reg in (brs, brt) and rd in (brs, brt):
                         reqs.append(v)
+        # SuperNOVA 2's compiler folds a chain of consecutive requests into a
+        # range check on the loaded register:
+        #     addiu rX, rX, -0x4520 ; sltiu $at, rX, 2   -> 0x4520, 0x4521
+        # Same requests as SuperNOVA's two beqs, invisible to the chain test.
+        if (op == 9 and infl_reg is not None and va - infl_at <= 0x40
+                and (w >> 21) & 0x1f == infl_reg):
+            base = -(w & 0xffff) & 0xffff
+            nxt = w32(va + 4)
+            rd = (w >> 16) & 0x1f
+            if (is_op(base) and nxt is not None and nxt >> 26 == 0x0b
+                    and (nxt >> 21) & 0x1f == rd):
+                for v in range(base, base + (nxt & 0xffff)):
+                    if v != own and v not in reqs:
+                        reqs.append(v)
         if op == 0x0d and (w & 0xffff) in (2, 0xe):
             flags.append(w & 0xffff)
         if op == 3:                           # jal
@@ -175,8 +207,8 @@ found = {}
 # The three receive dispatches all live in one small region; scanning the whole
 # ELF matches unrelated compare chains (menu ids, error tables) and produces
 # noise. Parsers likewise all sit in the network block.
-CHAIN_LO, CHAIN_HI = 0x00271700, 0x00273500
-PARSER_LO, PARSER_HI = 0x00269000, 0x00274000
+CHAIN_LO, CHAIN_HI = PROFILE['chain']
+PARSER_LO, PARSER_HI = PROFILE['parsers']
 
 for o in range((CHAIN_LO - VB + FO), (CHAIN_HI - VB + FO), 4):
     va = o - FO + VB

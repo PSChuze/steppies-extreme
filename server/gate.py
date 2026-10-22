@@ -25,6 +25,7 @@ import binascii
 import hashlib
 import json
 import os
+import random
 import select
 import socket
 import math
@@ -524,13 +525,68 @@ SN_STATUS_ONLY = (0x3121, 0x4204, 0x8001, 0x8003, 0x8005, 0x8007,
 # The s32 is presumed to be the room id.
 SN_STATUS_COUNT = (0x7001, 0x7011, 0x4331)
 
+# The u8 at the end of SuperNOVA's 0x4431, from the player's side. Anything
+# but 0 and 1 draws neither banner; see Session.hold_sn_endgame.
+SN_VERDICT = {'win': 0, 'loss': 1, 'draw': 2}
 
-def response_sequence(request_opcode, is_sn=False):
+
+# ── SuperNOVA 2 (SLUS-21608) ────────────────────────────────────────────────
+#
+# SuperNOVA 2 is SuperNOVA's client rebuilt: the same codec function for
+# function, the same dispatch, and tools/sndispmap.py's map of it differs from
+# SuperNOVA's in only a handful of groups. A SuperNOVA 2 session is therefore
+# also `is_sn`, and everything below is an override on top of the SuperNOVA
+# tables, gated on `Session.is_sn2`.
+#
+# The one change that runs through all of it: **rooms hold up to four slots,
+# and room messages name the player they are about.** Where SuperNOVA had one
+# opponent record and bare flag bytes, SuperNOVA 2 walks the room's four slots
+# for a matching player id (`0x296980` returns the room, `0x295720(room, i)`
+# the id in slot i). So every push that changes a player's state carries that
+# player's id, and a push with id 0 silently matches nobody.
+REQUEST_RESPONSES_SN2 = {
+    # JOIN is now two steps. 0x4324 shrank to a bare status (parser
+    # 0x00270910) and the room itself comes from the new bodiless 0x4332
+    # (builder 0x00270e40), answered by 0x4333 -- see build_sn2_room_record.
+    0x4332: (0x4333,),
+    # 0x4313 0x00271110, END with no body, in-flight check 0x4312.
+    0x4312: (0x4313,),
+    # Two bodiless requests (issuers 0x0026b5e0, 0x0026b450, called from two
+    # different scenes, 0x0029c970 and 0x002a0d64) whose replies 0x4461 /
+    # 0x4471 are ENDs on the main RPC block, found by tools/snblocks.py since
+    # neither compares the in-flight request. Each reply is u32 status, s32
+    # id, u8, and the u8 goes to that id's slot through 0x00295e40 -- the
+    # setter 0x4412 drives, so it is the slot's ready state. Which request
+    # means what is not known; see payload_for_sn2.
+    0x4460: (0x4461,),
+    0x4470: (0x4471,),
+}
+
+# Bare u32 status in SuperNOVA 2, where SuperNOVA sent more.
+SN2_STATUS_ONLY = (0x4324,)
+
+# Requests SuperNOVA 2 sends WITHOUT setting the in-flight field at ctx+0x2370
+# -- each issuer builds the message and hands it to 0x0026a580 without ever
+# waiting for a reply. Answering them with the +1 guess would be worse than
+# useless: 0x43c1 has a parser with no in-flight check, so an unsolicited copy
+# raises its event flag.
+#   0x43c0  u32, s8            0x0026b900
+#   0x43c2  s32, u32           0x0026b750
+#   0x4403  u16, s32           0x0026bb50
+#   0x4404  u32, s8, s8, u16   0x0026bab0   relayed as 0x4405, see relay_sn2_state
+SN2_NO_REPLY = {0x43c0, 0x43c2, 0x4403, 0x4404}
+
+
+def response_sequence(request_opcode, is_sn=False, is_sn2=False):
     """Opcodes to send in reply to `request_opcode`, terminator last.
 
     Unknown requests fall back to +1 -- a guess, logged as such by the caller,
     and only correct by luck. Prefer adding the real mapping from reqmap.py.
     """
+    if is_sn2:
+        seq = REQUEST_RESPONSES_SN2.get(request_opcode)
+        if seq:
+            return (seq, True)
     if is_sn:
         seq = REQUEST_RESPONSES_SN.get(request_opcode)
         if seq:
@@ -688,10 +744,101 @@ LIST_BYTE = {FRIEND_LIST: 0, IGNORE_LIST: 1}
 
 
 def online_ids():
-    """Player ids with a live SuperNOVA lobby connection. Caller must NOT hold
-    WAITING_LOCK."""
+    """Player ids with a live SuperNOVA or SuperNOVA 2 lobby connection.
+    Accounts are shared between the two, so a friend is online in either.
+    Caller must NOT hold WAITING_LOCK."""
     with WAITING_LOCK:
         return {(w.player or {}).get('id') for w in LOBBY if w.is_sn}
+
+
+# ── LIVE STATUS FILE ─────────────────────────────────────────────────────────
+#
+# Lobby state lives only in this process, and the boards (boards.py) run in
+# another one. So a daemon writes a snapshot of it to live.json in the state
+# directory every --live-every seconds: who is connected to which game, and
+# what each is doing. os.replace makes each write atomic, so a reader never
+# sees half a file. The stamp lets a reader tell a stopped gate from an empty
+# lobby.
+
+def session_activity(w):
+    """What one lobby connection is doing. Caller holds WAITING_LOCK."""
+    if w.peer is not None:
+        return 'playing' if w.start_sent else 'matched'
+    if w.in_room or w.sn_room is not None:
+        return 'room'
+    if w.sn_searching:
+        return 'searching'
+    return 'lobby'
+
+
+def live_snapshot(args=None):
+    """{stamp, games: {game: {count, players}}, sn_comps}. The competitions are
+    here because some come from gate flags the boards cannot see. Caller must
+    NOT hold WAITING_LOCK."""
+    games = {'e2': [], 'sn': [], 'sn2': []}
+    with WAITING_LOCK:
+        for w in LOBBY:
+            p = w.player or {}
+            games['sn2' if w.is_sn2 else 'sn' if w.is_sn else 'e2'].append({
+                'id': p.get('id'), 'name': p.get('name') or '?',
+                'dancer': p.get('dancer'), 'activity': session_activity(w),
+                'vs': (w.peer.player or {}).get('id') if w.peer else None})
+    now = time.time()
+    return {'stamp': now,
+            'games': {g: {'count': len(ps), 'players': ps}
+                      for g, ps in games.items()},
+            'sn_comps': sn_competitions(args, int(now)) if args else [],
+            'sn2_comps': sn2_competitions(args, int(now)) if args else []}
+
+
+def write_live(path, args=None):
+    tmp = '%s.tmp' % path
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(live_snapshot(args), fh, separators=(',', ':'))
+    os.replace(tmp, path)
+
+
+def keepalive(conn, idle=60, every=15, count=4):
+    """Have the kernel notice a client that is gone.
+
+    A lobby connection can be silent for hours while its player is genuinely
+    playing: Extreme 2 says nothing on it after the first half-minute, and the
+    server only writes to it when a match needs relaying. So silence cannot be
+    the test. But a console switched off, or a line that dropped, never sends
+    a FIN -- and behind the VPS's port forward nothing else will -- so its
+    session stayed in LOBBY for good: in live.json, in the boards' online
+    count, in every other player's list. Seen 2026-10-11: one Extreme 2 player
+    shown online for 36 hours after leaving.
+
+    TCP keepalive asks the far end's TCP stack, not the game, so a live
+    console answers whatever it is doing. After `idle` quiet seconds a probe
+    goes out every `every` seconds, and after `count` unanswered ones the
+    socket fails: recv raises, run() ends, and the session leaves LOBBY as on
+    any disconnect. About two minutes from vanishing to gone.
+    """
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (('TCP_KEEPIDLE', idle), ('TCP_KEEPINTVL', every),
+                            ('TCP_KEEPCNT', count)):
+            if hasattr(socket, name):           # Linux; elsewhere the defaults
+                conn.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except OSError:
+        pass
+
+
+def start_live_writer(path, every, args):
+    def loop():
+        failed = False
+        while True:
+            try:
+                write_live(path, args)
+                failed = False
+            except OSError as e:
+                if not failed:
+                    print('!! cannot write %s (%s)' % (path, e), flush=True)
+                failed = True
+            time.sleep(every)
+    threading.Thread(target=loop, name='live-writer', daemon=True).start()
 
 
 def friends_of(pid):
@@ -812,6 +959,9 @@ def state_load(path):
     # still empty, so an existing server keeps its accounts. STATE_PATH stays
     # the state.json path: other code derives the state directory from it.
     db.setup(os.path.dirname(path) or '.')
+    # content.json (news, the Ranking Challenge override) lives beside it too.
+    content.DEFAULT_PATH = os.path.join(os.path.dirname(path) or '.',
+                                        'content.json')
     loaded = db.load_state()
     STATE.clear()
     STATE.update(loaded)
@@ -1101,8 +1251,12 @@ def parse_sn_createroom(payload):
     if len(payload) < 17:
         return None
     f1, f2, f3, f4, f5, f6, f7 = struct.unpack('>iHBBiBi', payload[:17])
-    return {'id': f1, 'song': f2, 'f3': f3, 'f4': f4, 'f5': f5,
+    room = {'id': f1, 'song': f2, 'f3': f3, 'f4': f4, 'f5': f5,
             'f6': f6, 'f7': f7}
+    # SuperNOVA 2's builder writes one more s8 (18 bytes). Unidentified.
+    if len(payload) >= 18:
+        room['f8'] = struct.unpack_from('>b', payload, 17)[0]
+    return room
 
 
 def roomlist_entry_sn(room, name):
@@ -1140,22 +1294,38 @@ def roomlist_entry_sn(room, name):
     | u8 | 1 | `+0x21` | |
     | s32 | 4 | `+0x08` | |
     | u8 | 1 | `+0x22` | **listed flag, bit 0** |
-    | u16 | 2 | `+0x0c` | **the song the row DISPLAYS** |
+    | u16 | 2 | `+0x0c` | **the owner's NAT word**, NOT a song -- see below |
     | u8 | 1 | `+0x23` | **locked, bit 0**, set and the room cannot be entered |
     | u8 | 1 | `+0x24` | |
 
-    **THERE ARE TWO SONG FIELDS AND BOTH HAVE TO BE SET.** Observed on screen
-    2026-09-13: with only `+0x0e` filled, the room listed correctly in every
-    respect except the song, which drew as random. The renderer converges on
+    **`+0x0e` IS THE SONG AND `+0x0c` IS THE OWNER'S NAT WORD.** The row
+    builder (`FUN_00a625f0`) does
 
-        display[+0x80] = entry[+0x0c]        ; 0x00a626f8, both branches
+        display[+0x82] = entry[+0x0e] == 90 ? 79 : 0x0027ec80(entry[+0x0e])
+        display[+0x80] = entry[+0x0c]
+        display[+0x7c] = verdict(0x00277d70(my NAT word, display[+0x80]))
 
-    and `+0x80` is what it hands to the banner lookup `0x00277d70`, so `+0x0c`
-    -- wire offset 32 -- is the song the row actually shows. `+0x0e` is only
-    tested against 90 and passed to the availability filter `0x0027ec80`, whose
-    result lands in `+0x82`; on the `== 90` path the filter is skipped entirely
-    and `+0x82` is set to 79, which is what makes 90 look like a "random"
-    sentinel. Both fields are served with the same song id.
+    and the banner (`FUN_00a622a0`) is drawn from `+0x82` alone: 0..78 is a
+    song, anything else the "random" art. `0x00277d70` is not a banner lookup,
+    it is the NAT-compatibility table read by the peer connect: it maps each
+    code (0, 1, 2, 0x10, 0x50, 0x30, 0x90, 0xb1, 0xb3, 0xd0) to an index and
+    reads the 10x10 table at `0x002cff10`, and **any other value is index 2,
+    the row that fails against everything**. The join handler
+    (`FUN_00a63ad0`) refuses a row whose verdict is 3 without sending
+    anything, and on a join `FUN_00a648d0` copies `display[+0x80]` into slot
+    A's NAT word (`+0x338`) for the connect.
+
+    This field used to carry the song, on a misreading of the function above.
+    Song 0 happens to be a valid NAT code, so rooms made with the default song
+    could be joined and every other room could not: a room created on song 6,
+    11, 53 or random (90) listed normally and the join button did nothing.
+    Players worked around it by creating the room on defaults and picking the
+    song afterwards, which goes out as `0x43b2` and never touches this field.
+    (Reported 2026-09; the log shows no `0x4323` for any such room.)
+
+    It is served as 0. Against every joiner code except 2 that gives verdict
+    2, which is joinable, and 0 is the peer NAT word `0x4325` and `0x4a13`
+    already carry. The real word would only matter without `--udp-relay`.
 
     **WIRE +34 BIT 0 LOCKS THE ROOM.** Observed 2026-09-13: the room listed,
     but selecting it drew a padlock and "you cannot enter this room". The join
@@ -1170,9 +1340,9 @@ def roomlist_entry_sn(room, name):
     WIDTH is not the same as echoing it into a field of the same MEANING. It is
     served as zero now, and the room is joinable.
 
-    The id, both song fields, the name, the listed flag and the lock are placed
-    with confidence. The rest are given the CreateRoom values whose types line up,
-    in order, on the reasoning that a room record is mostly an echo of the room
+    The id, the song, the NAT word, the name, the listed flag and the lock are
+    placed with confidence. The rest are given the CreateRoom values whose types
+    line up, in order, on the reasoning that a room record is mostly an echo of the room
     created -- a structural guess, but one that round-trips what the client
     said.
     """
@@ -1193,9 +1363,17 @@ def roomlist_entry_sn(room, name):
             # whose only known meaning is bit 0 = listed. 1 is the value every
             # working room list has used.
             + bytes([1])
-            + struct.pack('>H', r.get('song', 0) & 0xffff)   # the DISPLAYED song
+            + struct.pack('>H', 0)      # the owner's NAT word -- NOT the song
             + bytes([0])                             # LOCKED bit -- must be 0
             + bytes([0]))
+
+
+def roomlist_entry_sn2(room, name):
+    """SuperNOVA 2's `0x4310` / `0x4322` record: SuperNOVA's 36 bytes and one
+    more u8 (parsers `0x00271620` and `0x002711b0`), unidentified and zero.
+    The list is a read-until-empty loop, so a record one byte short would
+    take the next record's first byte as its last."""
+    return roomlist_entry_sn(room, name) + bytes([0])
 
 
 def playerlist_entry_sn(ident, name, dancer=0, probe=False):
@@ -1702,7 +1880,7 @@ import udprelay
 import publicaddr
 from schedule import (RC_BAD_SONG_IDS, RC_TESTED_SONG_IDS,
                       RC_WEEK_SECONDS, RC_WEEKS,
-                      rc_week, rc_auto_songs)
+                      rc_week, rc_auto_songs, sn2_auto_competitions)
 
 
 def rc_info(status=0, first_song=1, hdr=None, flags=None, vary=None,
@@ -1972,6 +2150,50 @@ def sn_news_bodies(items, fields=None, wrap=0):
     return out
 
 
+# ── The Information reader (SuperNOVA) ─────────────────────────────────────
+#
+# ONLINE PLAY shows two different news screens and they come from two
+# different messages. The ALERTS that pop up after login are 0x3122 (above).
+# INFORMATION, the browsable reader that comes up before them, is 0x200a, the
+# SvrInfo DATA part of the GATE phase. Extreme 2 uses 0x200a for a server
+# record and a message of the day; SuperNOVA's parser FUN_0026ab60 reads the
+# same record as an alert instead, one per frame, into a list at ctx+0x59d0:
+#
+#     s32 / s32 / s32 unix time / char[64] title / cstring body (<= 512)
+#
+# Serving it the Extreme 2 record made the reader show one empty story: the
+# timestamp field landed on "0.64" out of the advertised address (0x302e3634,
+# 1995.08.13 17:28) and the title on ".0.60". The parser has no count limit,
+# so the list is capped here. An empty list would draw an uninitialised row,
+# so there is always at least one entry.
+SN_INFO_MAX = 10
+SN_INFO_DEFAULT = ('SERVER INFORMATION|Welcome to the DDR SuperNOVA private '
+                   'server. News from the operator will appear here.')
+SN_INFO_SINCE = int(time.time())
+
+
+def sn_info_bodies(items, wrap=0):
+    """The 0x200a records for the Information reader, one per frame.
+
+    Each item is "TITLE|BODY" or a dict with title, body and an optional unix
+    "time", which is the publication date the reader shows. Without one the
+    entry is dated when this server started, so it does not look new on every
+    login.
+    """
+    out = []
+    for i, item in enumerate((items or [SN_INFO_DEFAULT])[:SN_INFO_MAX]):
+        if isinstance(item, dict):
+            title, body = item.get('title', ''), item.get('body', '')
+            when = int(item.get('time') or SN_INFO_SINCE)
+        else:
+            title, _, body = item.partition('|')
+            when = SN_INFO_SINCE
+        title, body = title.strip(), body.strip()
+        out.append(sn_news_record(i + 1, title, body or title,
+                                  (i + 1, 0, when), wrap))
+    return out
+
+
 def sn_song_ids(mode):
     """Which song ids to mark available, for the --sn-songs setting."""
     if mode == 'online':
@@ -2183,30 +2405,10 @@ def sn_competitions(args, now):
     unix "start" and "end" override it. Without the file, the --sn-comp flags
     give one open competition and optionally one future one, as before.
     """
-    path = args.sn_comp_file or (
-        os.path.join(os.path.dirname(STATE_PATH), 'sn_competitions.json')
-        if STATE_PATH else '')
-    if path and os.path.exists(path):
-        try:
-            with open(path, encoding='utf-8') as f:
-                raw = json.load(f)
-            comps = []
-            for e in raw[:SN_COMP_MAX]:
-                start = int(e.get('start',
-                                  now + e.get('start_days', -1) * 86400))
-                end = int(e.get('end',
-                                start + e.get('length_days', 30) * 86400))
-                songs = [int(s) & 0xffff for s in e.get('songs', [0])]
-                comps.append({'id': int(e['id']),
-                              'name': str(e.get('name', '')),
-                              'songs': songs[:SN_STAGES] or [0],
-                              'start': start, 'end': end,
-                              'difficulty': e.get('difficulty'),
-                              'options': e.get('options')})
-            return comps
-        except (OSError, ValueError, KeyError, TypeError) as e:
-            print('!! %s is unreadable (%s); using the --sn-comp flags'
-                  % (path, e), flush=True)
+    comps = load_comp_file(comp_file_path(args.sn_comp_file,
+                                          'sn_competitions.json'), now)
+    if comps is not None:
+        return comps
     comps = []
     if args.sn_comp == 'open':
         comps.append({'id': 1, 'name': args.sn_comp_name,
@@ -2221,6 +2423,56 @@ def sn_competitions(args, now):
                       'songs': args.sn_comp_songs,
                       'start': start, 'end': start + args.sn_comp_ahead})
     return comps
+
+
+def comp_file_path(given, default_name):
+    return given or (os.path.join(os.path.dirname(STATE_PATH), default_name)
+                     if STATE_PATH else '')
+
+
+def load_comp_file(path, now):
+    """A competition list file, or None when there is none to use. The
+    format is the one sn_competitions describes."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            raw = json.load(f)
+        comps = []
+        for e in raw[:SN_COMP_MAX]:
+            start = int(e.get('start',
+                              now + e.get('start_days', -1) * 86400))
+            end = int(e.get('end',
+                            start + e.get('length_days', 30) * 86400))
+            songs = [int(s) & 0xffff for s in e.get('songs', [0])]
+            comps.append({'id': int(e['id']),
+                          'name': str(e.get('name', '')),
+                          'songs': songs[:SN_STAGES] or [0],
+                          'start': start, 'end': end,
+                          'difficulty': e.get('difficulty'),
+                          'options': e.get('options')})
+        return comps
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print('!! %s is unreadable (%s); ignoring it' % (path, e), flush=True)
+        return None
+
+
+def sn2_competitions(args, now):
+    """SuperNOVA 2's competitions: sn2_competitions.json beside the state
+    file (or --sn2-comp-file) when it exists, in sn_competitions' format,
+    and otherwise the clock-driven set from schedule.sn2_auto_competitions --
+    a weekly cup and a 28-day marathon, each with the next one listed as
+    upcoming. --sn2-comp none serves no competitions at all.
+
+    Kept apart from SuperNOVA's because the two games' song ids differ.
+    """
+    comps = load_comp_file(comp_file_path(getattr(args, 'sn2_comp_file', ''),
+                                          'sn2_competitions.json'), now)
+    if comps is not None:
+        return comps
+    if getattr(args, 'sn2_comp', 'auto') == 'none':
+        return []
+    return sn2_auto_competitions(now)
 
 
 # ── The two RC PLAY requests, entering a challenge and posting a result ────
@@ -2335,7 +2587,16 @@ def diff_blobs(old, new):
             for i, (a, b) in enumerate(zip(old, new)) if a != b]
 
 
-def ranking_entry_sn(rank, name, ident=0, dancer=0):
+# SuperNOVA ranking row: which of the three counters is which. The screen
+# (FUN_00a601b4 in DATA04) clamps all three at 9999 and sums them for the
+# player's own MATCH, so they are win / lose / draw -- but the code does not
+# say in what order. This is Extreme 2's wire order, confirmed four times
+# there (see HTOH_LOG_NAMES); UNCONFIRMED here. --stat-probe serves 222 /
+# 333 / 444 in these three slots, so one screenshot of the board settles it.
+SN_RANK_COUNTERS = ('win', 'draw', 'loss')
+
+
+def ranking_entry_sn(rank, name, ident=0, dancer=0, values=None, probe=False):
     """One SuperNOVA `0x6002` ranking row -- **45 bytes**, not Extreme 2's 49.
 
     Parser `0x0026dbc0`, a read-until-empty loop:
@@ -2347,18 +2608,31 @@ def ranking_entry_sn(rank, name, ident=0, dancer=0):
     drew four rows on screen, the last two nameless "NO DATA" (2026-09-14).
 
     The screen prints a rank number, the dancer icon, the name and four
-    counters labelled MATCH / WIN / LOSE / DRAW, so four of the five trailing
-    s32 are those. WHICH four, and in what order, is not established -- Extreme
-    2's equivalent famously runs WIN, DRAW, LOSS while the UI prints
-    WIN / LOSS / DRAW, so the order here is not worth guessing. All five are
-    served as zero until a real result exists to put in them.
+    counters labelled MATCH / WIN / LOSE / DRAW. What the screen does with
+    the five trailing s32 (FUN_00a601b4, DATA04, which copies each row out):
+
+        s32 #1   clamped to 999,999,999    a total -- served as the points
+        s32 #2-4 clamped to 9999 each      and SUMMED for the viewer's own
+                                           MATCH: the three counters
+        s32 #5   clamped to 999            unknown, served as 0
+
+    So MATCH is not on the wire; it is win + lose + draw. The order of the
+    three is SN_RANK_COUNTERS. `values` is a dict with those keys and
+    'points'; None serves zeros, which is what a board with no kept results
+    has always shown.
     """
     nm = (name or '').encode('ascii', 'replace')[:16].ljust(16, bytes(1))
+    v = values or {}
+    if probe:
+        tail = (11111, 222, 333, 444, 555)
+    else:
+        tail = ((v.get('points', 0),)
+                + tuple(v.get(k, 0) for k in SN_RANK_COUNTERS) + (0,))
     return (struct.pack('>i', rank)
             + struct.pack('>i', ident)
             + nm
             + bytes([dancer & 0xff])
-            + struct.pack('>iiiii', 0, 0, 0, 0, 0))
+            + struct.pack('>iiiii', *tail))
 
 
 def parse_setmyaddr(payload):
@@ -2385,6 +2659,88 @@ def parse_setmyaddr(payload):
             'tail': struct.unpack_from('>H', payload, 37)[0]}
 
 
+def parse_x2_createroom(payload):
+    """The Extreme 2 `0x4330 CreateRoom` body -- 34 bytes.
+
+    Builder `0x0085ad70` (DATA07): a fixed 32-byte string ("ddrex2" in every
+    capture), then two u8 arguments from `NetPrgCreateRoom` (`FUN_001dfa70`).
+    Its callers, the search tasks such as `FUN_001f0c50`, pass the two rows
+    of the head-to-head options menu (`FUN_001f0690`, drawn by
+    `FUN_001f1150`):
+
+        +0x20  row 1, DAT_0104bf0a, sent as is: 0 / 1 / 2 / 3, labels
+               197 / 198 / 199 / 196. The WIN CONDITION: the menu offers only
+               values whose bit is set in the 0x441e rule mask (plus bits 0
+               and 3 always), so 0 is SCORE, 1 COMBO, 2 SURVIVAL, 3 "any".
+        +0x21  row 0, DAT_0104bf09, through the table at 0x002e7ce0:
+               0 / 1 / 2 / 4, labels 192 / 193 / 194 / 196. The DIFFICULTY:
+               Light, Standard, Heavy, and "any" (label 196 again).
+
+    Seen on the live server: +0x20 in {0, 1, 3}, +0x21 in {0, 1, 2, 4}.
+    Nothing in the request names a song; the server has to pick one.
+    """
+    if len(payload) < 34:
+        return None
+    return {'rule': payload[32], 'diff': payload[33]}
+
+
+X2_ANY_RULE = 3     # "any" on the win-condition row
+X2_ANY_DIFF = 4     # "any" on the difficulty row
+
+
+def x2_rules_compatible(ra, rb):
+    """Two Extreme 2 searches can be paired if their win conditions agree or
+    either picked "any". A search we could not parse counts as "any"."""
+    a = (ra or {}).get('rule', X2_ANY_RULE)
+    b = (rb or {}).get('rule', X2_ANY_RULE)
+    return a == b or X2_ANY_RULE in (a, b)
+
+
+def x2_match_settings(ra, rb, rule_mask=(1, 1, 1), rng=random):
+    """What an Extreme 2 head-to-head plays: (mode, song, diff_a, diff_b).
+
+    `ra` and `rb` are the two players' parse_x2_createroom results.
+
+    - mode, the `0x44b0` R+0x00, is the agreed win condition. The client
+      numbers it the way the menu does: the play loop (`FUN_00236440`) ends a
+      match early on a player's fail flag only for modes 1 and 2, COMBO and
+      SURVIVAL, never for 0, SCORE. "Any" takes the other side's choice;
+      "any" against "any" is drawn from what the rule mask allows.
+    - song: nothing in the protocol carries a choice, so it is drawn from the
+      ids the Ranking Challenge has proven safe (schedule.py). Serving 0 every
+      time is why head-to-head only ever played one song.
+    - difficulties, R+0x01 / R+0x02: each player's own. "Any" takes the other
+      player's, and "any" against "any" is Standard. The client resolves a
+      lone 4 itself, but two 4s send FUN_002379e0 to Challenge, which nobody
+      picked.
+    """
+    a = (ra or {}).get('rule', X2_ANY_RULE)
+    b = (rb or {}).get('rule', X2_ANY_RULE)
+    if a != X2_ANY_RULE:
+        mode = a
+    elif b != X2_ANY_RULE:
+        mode = b
+    else:
+        allowed = [i for i, on in enumerate(list(rule_mask)[:3]) if on] or [0]
+        mode = rng.choice(allowed)
+    if not 0 <= mode <= 2:
+        mode = 0
+
+    def diff(r):
+        d = (r or {}).get('diff', X2_ANY_DIFF)
+        return d if d in (0, 1, 2, 3) else X2_ANY_DIFF
+    da, db = diff(ra), diff(rb)
+    if da == X2_ANY_DIFF and db == X2_ANY_DIFF:
+        da = db = 1
+    elif da == X2_ANY_DIFF:
+        da = db
+    elif db == X2_ANY_DIFF:
+        db = da
+
+    pool = sorted(RC_TESTED_SONG_IDS - RC_BAD_SONG_IDS) or [0]
+    return mode, rng.choice(pool), da, db
+
+
 def build_match_record(opponent, tail=None):
     """The `0x44b0` body -- 61 bytes. THE MATCH MESSAGE.
 
@@ -2405,10 +2761,12 @@ def build_match_record(opponent, tail=None):
     | u16  |  2   | R+0x42   | opponent LOCAL port                   |
     | str  | 16   | R+0x1d   | opponent PUBLIC address               |
     | u16  |  2   | R+0x2e   | opponent PUBLIC port                  |
-    | u8   |  1   | R+0x00   | ? -> DAT_0104c094                     |
-    | u8   |  1   | R+0x01   | ? (not read by the bridge)            |
-    | u16  |  2   | R+0x04   | ? -> FUN_001e7060() -> DAT_0104c090   |
-    | u8   |  1   | R+0x02   | ? (not read by the bridge)            |
+    | u8   |  1   | R+0x00   | win condition (mode) -> DAT_0104c094  |
+    | u8   |  1   | R+0x01   | the RECIPIENT's difficulty            |
+    | u16  |  2   | R+0x04   | the song -> FUN_001e7060()            |
+    | u8   |  1   | R+0x02   | the OPPONENT's difficulty             |
+
+    x2_match_settings decides the last four.
 
     The local/public split is not a guess. `FUN_00235d40` (the lobby->versus
     bridge) runs BOTH strings through `inet_addr` (`0x00852b60`), and the peer
@@ -2441,10 +2799,14 @@ def build_match_record(opponent, tail=None):
     #     the field for us, and also means a bad song id here is recoverable
     #     rather than fatal.
     #
-    # R+0x01 and R+0x02 are read by NOTHING. The bridge is the only consumer of
-    # this record and it touches +0x00, +0x04, +0x08, +0x0c, +0x1d, +0x2e,
-    # +0x30 and +0x42; neither binary materialises the offsets of the other two
-    # anywhere else. They are the two fields that never meant anything.
+    # R+0x01 and R+0x02 ARE READ: they are the two players' DIFFICULTIES. An
+    # earlier pass said "read by nothing" because the bridge body does not
+    # touch them, but the bridge's last call, FUN_002379e0, reads ctx+0x2a339
+    # and ctx+0x2a33a directly. R+0x01 becomes the recipient's own chart
+    # (DAT_0104c01e, play-block player 0) and R+0x02 the opponent's
+    # (DAT_0104c076, player 1): 0 Light, 1 Standard, 2 Heavy, 3 Challenge, 4
+    # "whatever the other one is". Serving 0 for both is why every
+    # head-to-head was on Light (reported 2026-09).
     #
     # FUN_001e7060 is the same lookup the RC song ids go through: it reads
     # *(s16 *)(0x002e7850 + id*2), a table with exactly 80 valid entries, and
@@ -2712,6 +3074,102 @@ def build_sn_peeraddr_record(player, dial=None):
             + struct.pack('>i', (player or {}).get('id', 0)))
 
 
+def build_sn2_member_record(player, slot, dial=None, ready=0, flags=True):
+    """One SuperNOVA 2 room member -- 81 bytes, or 79 without the two flags.
+
+    SuperNOVA 2 has no `0x4b00`: nothing in the executable builds it, so the
+    client never asks where its opponent is. The address travels in this
+    record instead, which is why `0x4325` and `0x4333` are all it needs.
+    Wire order is the call order in the `0x4333` loop (`0x00270c20`); the
+    setter `0x00295fc0` files it into the room's slot array, stride 0xa0 from
+    room+0x38:
+
+    | wire | slot | is |
+    |---|---|---|
+    | s32 | +0x04 | player id -- the key every room push is matched on |
+    | char[16] | +0x08 | name |
+    | u8 | +0x19, +0x1a | dancer (stored twice) |
+    | u8 | +0x1b | |
+    | s8 | +0x1c | |
+    | s32 | +0x20 | |
+    | u16 x5 | +0x24..+0x2c | |
+    | u8 | +0x2e | |
+    | s32 | +0x30 | |
+    | u16, u16 | +0x34, +0x36 | ports |
+    | char[16] x2 | +0x38, +0x49 | addresses, NUL-terminated in the slot |
+    | s8 | | the SLOT, 0..3, the setter's index |
+    | s8 | | ready -- `0x295e40`, the setter `0x4412` drives |
+    | s8 | | `0x295df0`, unidentified |
+
+    `0x4325` (parser `0x002706d0`) reads the first 79 bytes, ending at the
+    slot: `flags=False`.
+
+    The two port/address pairs are served public first, the way SuperNOVA's
+    `0x4b01` orders them. That ordering is NOT confirmed for SuperNOVA 2, and
+    under `--udp-relay` it does not matter, because both pairs are the relay.
+    The stat fields are zero, as they are in every SuperNOVA record.
+    """
+    def s16(v):
+        return (v or '').encode('ascii', 'replace')[:16].ljust(16, bytes(1))
+
+    p = player or {}
+    ep = p.get('endpoint') or {}
+    if dial is not None:
+        ep = {'public': dial[0], 'public_port': dial[1],
+              'local': dial[0], 'local_port': dial[1]}
+    out = (struct.pack('>i', p.get('id', 0))
+           + s16(p.get('name'))
+           + bytes([p.get('dancer', 0) & 0xff, 0, 0])
+           + struct.pack('>i', 0)
+           + struct.pack('>HHHHH', 0, 0, 0, 0, 0)
+           + bytes([0])
+           + struct.pack('>i', 0)
+           + struct.pack('>HH', ep.get('public_port', 0) & 0xffff,
+                         ep.get('local_port', 0) & 0xffff)
+           + s16(ep.get('public')) + s16(ep.get('local'))
+           + bytes([slot & 0xff]))
+    if flags:
+        out += bytes([ready & 0xff, 0])
+    return out
+
+
+def build_sn2_room_record(room, owner_name, members):
+    """The SuperNOVA 2 `0x4333` body: status, the room, then its members.
+
+    Parser `0x00270a80`, the reply to the bodiless `0x4332`. It is SuperNOVA's
+    `0x4324` JOIN reply grown into a room roster:
+
+        u32 status
+        s32 / char[16] / s32 / u16 / u8 / s32 / u8 / s8    the room
+        u8 count
+        count x build_sn2_member_record                    81 bytes each
+
+    The room block goes to `0x002962c0(room, owner, name, song, a, b, 0, c)`.
+    The first s32 and the second u8 are read and dropped. The OWNER'S PLAYER
+    ID is the room's identity -- room+4, which `0x00295fc0` compares each
+    arriving member against to find the owner's slot, and which `0x4a04` /
+    `0x4a13` set from their one s32 -- and this server already uses the
+    creator's id as the room id. `a` and `b` get CreateRoom's f3 and f5, the
+    same two `roomlist_entry_sn` echoes; `c` is unidentified.
+
+    The count is a signed byte the loop compares with `slt`, so it is capped
+    at four, the size of the slot array.
+    """
+    r = room or {}
+    nm = (owner_name or '').encode('ascii', 'replace')[:16].ljust(16, bytes(1))
+    members = members[:4]
+    return (struct.pack('>I', 0)
+            + struct.pack('>i', 0)                       # dropped
+            + nm
+            + struct.pack('>i', r.get('id', 0))          # room+4, the owner
+            + struct.pack('>H', r.get('song', 0) & 0xffff)
+            + bytes([r.get('f3', 0) & 0xff])
+            + struct.pack('>i', r.get('f5', 0))
+            + bytes([0, 0])                              # dropped, then c
+            + bytes([len(members)])
+            + b''.join(members))
+
+
 def parse_create_playerfile(payload):
     """The 0x3020 NewCreatePlayerFile request body -- 18 bytes.
 
@@ -2739,7 +3197,13 @@ class Session(threading.Thread):
         # distinguishable by port (19573 vs 9573); the account connection is
         # only distinguishable because we hand SuperNOVA its own port in the
         # SvrList -- see --sn-svr-port.
-        self.is_sn = local_port in args.sn_ports
+        #
+        # SuperNOVA 2 is a third game on its own ports (29573/29570, the u16
+        # pair at 0x00301260) and is ALSO is_sn: it is SuperNOVA's client
+        # with overrides, so everything shared stays shared and the overrides
+        # key off is_sn2. The two never meet in a lobby -- see same_game.
+        self.is_sn2 = local_port in args.sn2_ports
+        self.is_sn = local_port in args.sn_ports or self.is_sn2
         self.args = args
         self.keybox = keybox
         self.buf = b''
@@ -2751,6 +3215,7 @@ class Session(threading.Thread):
         self.send_lock = threading.Lock()
         self.in_room = False
         self.sn_room = None   # SuperNOVA: the 0x4330 CreateRoom body, while it lasts
+        self.x2_room = None   # Extreme 2: win condition and difficulty, 0x4330
         self.friend_target = None  # name echoed back by 0x4522 / 0x4528
         self.sn_searching = False  # sent 0x4a00, no 0x4a02 yet
         self.pending_join_host = None  # 0x4323: push 0x4325 after the reply
@@ -2766,6 +3231,8 @@ class Session(threading.Thread):
         self.rank_req = None      # last 0x6000 ranking request, parsed
         self.endgame = None       # our 0x4430 report, until the peer's arrives
         self.endgame_peer = None  # who we were playing when we reported
+        self.endgame_held = False  # SuperNOVA: 0x4431 withheld for the verdict
+        self.sn_verdict = 0       # SuperNOVA: the u8 our next 0x4431 carries
         self.start_ready = False  # has sent 0x4410 GetStartStaus
         self.start_sent = False   # has been given the 0x4412 PLAY START gate
         self.start_held = False   # SuperNOVA: 0x4411 withheld until the peer readies
@@ -2845,10 +3312,23 @@ class Session(threading.Thread):
         if opcode in NO_REPLY:
             self.log('     (0x%04x is a notification -- not replying)' % opcode)
             return
+        if self.is_sn2 and opcode in SN2_NO_REPLY:
+            if opcode == 0x4404:
+                self.relay_sn2_state(payload)
+            else:
+                self.log('     (0x%04x is a SuperNOVA 2 notification -- not '
+                         'replying)' % opcode)
+            return
         self.observe(opcode, payload)
         if opcode == 0x4410 and self.is_sn and self.hold_sn_start():
             return
-        seq, known = response_sequence(opcode, self.is_sn)
+        # SuperNOVA 2's 0x4430 has a different shape (s32, s32, s16, s16, u16,
+        # s16, s16), so the verdict hold is SuperNOVA's alone until that report
+        # is decoded.
+        if (opcode == 0x4430 and self.is_sn and not self.is_sn2
+                and self.hold_sn_endgame(payload)):
+            return
+        seq, known = response_sequence(opcode, self.is_sn, self.is_sn2)
         if not known and opcode not in QUIET_GUESS:
             self.log('!! request 0x%04x is not in REQUEST_RESPONSES -- replying '
                      '0x%04x as a GUESS (+1). Add the real mapping from '
@@ -2892,7 +3372,9 @@ class Session(threading.Thread):
             self.try_sn_search()
         if self.pending_join_host is not None:
             host, self.pending_join_host = self.pending_join_host, None
-            if self.args.sn_host_push:
+            if self.is_sn2:
+                self.sn2_join(host)
+            elif self.args.sn_host_push:
                 self.log('     telling %s that %s joined (0x4325 + 0x4b01)'
                          % (host.who(), self.who()))
                 with WAITING_LOCK:
@@ -3161,6 +3643,30 @@ class Session(threading.Thread):
                                               9: r.get('rc_score', 0)})
                         for r in board)
 
+    def sn_ranking_body(self, fallback_rows):
+        """0x6002 rows for SuperNOVA, from kept head-to-head results.
+
+        SuperNOVA's 0x6000 is 8 bytes, `s32` start (-1 or 0 seen) and `s32`
+        count (100), with no board type and no week, so there is one board:
+        all time, most wins first. Until anyone has a kept result it is the
+        online players on zero, as before.
+        """
+        probe = self.args.stat_probe
+        board = results.h2h_board(0, self.args.svr_time or None, game='sn')
+        board = board[:RANKING_CAP - 1]
+        if not board or probe:
+            return b''.join(
+                ranking_entry_sn(i + 1, w.who(),
+                                 (w.player or {}).get('id', 0),
+                                 (w.player or {}).get('dancer', 0),
+                                 probe=probe)
+                for i, w in enumerate(fallback_rows))
+        self.log('     head-to-head board: %d row(s) from kept results'
+                 % len(board))
+        return b''.join(ranking_entry_sn(r['rank'], r['name'], r['player'],
+                                         r['dancer'], values=r)
+                        for r in board)
+
     def advertised_host(self):
         """The address to put in SvrInfo and SvrList, as the client sees us.
 
@@ -3189,13 +3695,28 @@ class Session(threading.Thread):
     def who(self):
         return self.player['name'] if self.player else '?'
 
+    def competitions(self, now):
+        """This game's tournaments: SuperNOVA 2 has its own song table, so
+        its own set."""
+        if self.is_sn2:
+            return sn2_competitions(self.args, now)
+        return sn_competitions(self.args, now)
+
+    def same_game(self, other):
+        """Whether `other` is a client of the same game. SuperNOVA and
+        SuperNOVA 2 share is_sn but not a song list or a record layout, so
+        neither may see, join or be paired with the other."""
+        return other.is_sn == self.is_sn and other.is_sn2 == self.is_sn2
+
     def enter_room(self):
         with WAITING_LOCK:
             if self not in WAITING:
                 WAITING.append(self)
             self.in_room = True
             others = [w for w in WAITING if w is not self and w.in_room
-                      and w.peer is None]
+                      and w.peer is None and self.same_game(w)
+                      and (self.is_sn
+                           or x2_rules_compatible(self.x2_room, w.x2_room))]
             partner = others[0] if (others and self.peer is None) else None
             if partner is not None:
                 self.peer, partner.peer = partner, self
@@ -3231,14 +3752,24 @@ class Session(threading.Thread):
         if self.is_sn or partner.is_sn:
             self.pair_sn(partner)
             return
-        self.log('     PAIRING with %s -- pushing 0x44b0 both ways'
-                 % partner.who())
+        if self.args.match_tail:
+            tails = {self: self.args.match_tail,
+                     partner: self.args.match_tail}
+            what = 'fixed tail %s' % (self.args.match_tail,)
+        else:
+            mode, song, mine, theirs = x2_match_settings(
+                self.x2_room, partner.x2_room, self.args.rule_mask)
+            tails = {self: (mode, mine, song, theirs),
+                     partner: (mode, theirs, song, mine)}
+            what = ('mode %d, song %d, difficulty %d vs %d'
+                    % (mode, song, mine, theirs))
+        self.log('     PAIRING with %s -- pushing 0x44b0 both ways (%s)'
+                 % (partner.who(), what))
         for a, b in ((self, partner), (partner, self)):
             if b.player is None:
                 a.log('!! partner %s has no player file -- 0x44b0 will be empty'
                       % b.who())
-            a.push(0x44b0, build_match_record(b.player or {},
-                                               self.args.match_tail))
+            a.push(0x44b0, build_match_record(b.player or {}, tails[a]))
 
     def push_later(self, sess, opcode, body, delay):
         """Push after a delay, off the receive thread.
@@ -3270,7 +3801,10 @@ class Session(threading.Thread):
         """
         if RELAY is None or self.relay_dial or other.relay_dial:
             return
-        pair = RELAY.alloc()
+        # Pin each port to its player's IP, so a stranger cannot take over
+        # the match by sending to it. See Relay.alloc.
+        pair = RELAY.alloc(*[(getattr(s, 'addr', None) or (None,))[0]
+                             for s in (self, other)])
         if pair is None:
             self.log('!!   udp relay pool exhausted -- falling back to the '
                      'addresses the consoles reported, which needs them to be '
@@ -3353,6 +3887,12 @@ class Session(threading.Thread):
             for s in (self, peer):
                 s.start_ready = s.start_held = s.start_sent = False
         self.log('     %s: telling %s (0x4351)' % (why, peer.who()))
+        if self.is_sn2:
+            # SuperNOVA 2 (parser 0x00270400): status, the id of the player
+            # who left, u8. It finds that id's slot; a non-zero u8 only marks
+            # the slot (0x00295f70), zero takes the player out of the room.
+            peer.push(0x4351, struct.pack('>IiB', 0, self.sn2_id(), 0))
+            return
         peer.push(0x4351, struct.pack('>I', 0))
 
     def relay_release(self):
@@ -3380,11 +3920,25 @@ class Session(threading.Thread):
             return
         with WAITING_LOCK:
             hosts = [w for w in LOBBY
-                     if w is not self and w.is_sn and w.sn_room is not None
-                     and w.player is not None]
+                     if w is not self and self.same_game(w)
+                     and w.sn_room is not None and w.player is not None]
             host = hosts[0] if hosts else None
         if host is None:
             self.log('     auto-search: no room to match into')
+            return
+        if self.is_sn2:
+            # SuperNOVA 2's 0x4a04 / 0x4a13 are status + the ROOM ID and
+            # nothing else (parsers 0x0026d820 / 0x0026d770): each hands the
+            # id to 0x00296390 and sets room+0x2c, 0 for 0x4a04 (guest) and 1
+            # for 0x4a13 (owner). The room's contents are fetched afterwards
+            # with 0x4332, so the searcher is paired here and told about the
+            # host by the 0x4333 that follows.
+            op = int(self.args.sn_search_push, 0)
+            rid = (host.sn_room or {}).get('id') or host.player.get('id', 0)
+            self.log('     auto-search: matching into room %d held by %s, '
+                     'pushing 0x%04x' % (rid, host.who(), op))
+            self.push(op, struct.pack('>Ii', 0, rid))
+            self.sn2_join(host)
             return
         song = (host.sn_room or {}).get('song', self.args.sn_match_song)
         # The searcher joins as a GUEST. FUN_00a47880 turns 0x4a04 into scene
@@ -3514,6 +4068,10 @@ class Session(threading.Thread):
             if len(payload) < 1:
                 return
             push, body, what = 0x43b5, payload[:1], 'difficulty %d' % payload[0]
+            if self.is_sn2:
+                # Whose difficulty: parser 0x0026dcb0 reads s32 then u8 and
+                # applies it to the slot holding that id.
+                body = struct.pack('>i', self.sn2_id()) + payload[:1]
         peer = self.peer
         if peer is None:
             self.log('     %s (no opponent to tell)' % what)
@@ -3567,8 +4125,136 @@ class Session(threading.Thread):
         self.log('     ready held until %s readies too' % peer.who())
         # Light the opponent-ready indicator on the other side now. On the
         # host it is the only sign that the guest is waiting on them.
-        self.push_later(peer, 0x4412, b'\x01', self.args.start_delay)
+        self.push_later(peer, 0x4412, self.sn_ready_body(1),
+                        self.args.start_delay)
         return True
+
+    def sn2_id(self):
+        return (self.player or {}).get('id', 0)
+
+    def sn_ready_body(self, ready):
+        """The `0x4412` push telling the OTHER side this player's readiness.
+
+        SuperNOVA: one u8 into ctx+0x14268. SuperNOVA 2 (parser 0x0026fc50):
+        s32 then u8, and the u8 goes to the slot holding that id
+        (0x00295e40) -- so it names the player who readied, not the one
+        being told."""
+        if self.is_sn2:
+            return struct.pack('>iB', self.sn2_id(), ready & 0xff)
+        return bytes([ready & 0xff])
+
+    def sn2_join(self, host):
+        """SuperNOVA 2: this player has entered `host`'s room.
+
+        Pairs the two, links the relay, and tells the host with `0x4325` --
+        the joiner's member record, address included, in slot 1. The joiner
+        learns about the host from the `0x4333` it asks for next. Both have
+        to see the relay endpoint, so the link comes before either record.
+        """
+        with WAITING_LOCK:
+            self.peer, host.peer = host, self
+        self.relay_link(host)
+        if not self.args.sn_host_push:
+            return
+        self.log('     telling %s that %s joined (0x4325)'
+                 % (host.who(), self.who()))
+        host.push(0x4325, build_sn2_member_record(
+            self.player, 1, host.relay_dial, flags=False))
+
+    def relay_sn2_state(self, payload):
+        """Forward a SuperNOVA 2 `0x4404` to the room as `0x4405`.
+
+        `0x4404` (builder 0x0026bab0, u32, s8, s8, u16) is sent without a
+        reply. `0x4405` (parser 0x0026b980) reads s32, s32, u8, u8, u16 --
+        the same fields with an s32 in front -- and applies the rest to the
+        room slot whose id equals that s32. So it is one player's state,
+        delivered to the others with the sender's id prepended. What the
+        state IS has not been identified; it is relayed as sent and logged.
+        """
+        peer = self.peer
+        self.log('     0x4404 state %s -> %s'
+                 % (payload.hex(), peer.who() if peer else 'nobody'))
+        if peer is None or len(payload) < 8:
+            return
+        peer.push(0x4405, struct.pack('>i', self.sn2_id()) + payload[:8])
+    def hold_sn_endgame(self, payload):
+        """SuperNOVA: hold this side's `0x4431` until both scores are in.
+
+        Returns True when the reply is being held; the caller then sends
+        nothing.
+
+        **The `0x4431` u8 is the match verdict, and the server decides it.**
+        The parser (`0x0026ecc0`) stores it at ctx+0x14264, and the result
+        scene's setup (`FUN_00a684f0`) copies it to the result object's
+        `+0x28`, which `FUN_001e5da0` turns into the banner:
+
+            0      -> WIN,  and the room tally +1 for this player
+            1      -> LOSE, and the room tally +1 for the opponent
+            other  -> neither (a draw); 3 is what a non-zero status leaves
+
+        It was always served as 0, so both players were told they had won
+        while the scores and judgements, which travel peer to peer, showed
+        the real result (reported 2026-09).
+
+        The request is the 36-byte `0x4430` Extreme 2 sends (builder
+        `0x0026ed90`, same field order), score first. Both players send it
+        within a moment of each other, so the first is held and the second
+        answers both, the way hold_sn_start pairs the two `0x4411`s. If the
+        opponent never reports -- they dropped mid-song -- a timer answers
+        after --sn-endgame-wait with a win.
+        """
+        g = results.parse_endgame(payload)
+        if g is None or self.player is None:
+            return False
+        me = {'player': self.player.get('id', 0), 'name': self.who(),
+              'dancer': self.player.get('dancer', 0), 'score': g['score']}
+        with results.LOCK:
+            other = self.peer
+            if other is None:
+                with WAITING_LOCK:
+                    other = next((w for w in LOBBY if w is not self and
+                                  getattr(w, 'endgame_peer', None) is self),
+                                 None)
+            theirs = (other.endgame if other is not None
+                      and other.endgame_peer in (self, None) else None)
+            if theirs is None:
+                if other is None:
+                    self.log('     endgame: score %d, no opponent -- a win'
+                             % g['score'])
+                    self.sn_verdict = 0
+                    return False
+                self.endgame, self.endgame_peer = me, other
+                self.endgame_held = True
+                self.log('     endgame: score %d, holding the verdict for %s'
+                         % (g['score'], other.who()))
+                threading.Thread(target=self.sn_endgame_timeout,
+                                 daemon=True).start()
+                return True
+            held = other.endgame_held
+            other.endgame = other.endgame_peer = None
+            other.endgame_held = False
+            self.endgame = self.endgame_peer = None
+        mine, their_result = results.record_h2h(
+            self.rc_now_week(), me, theirs, self.args.svr_time or None,
+            game='sn')
+        self.sn_verdict = SN_VERDICT[mine]
+        self.log('     kept: head-to-head %s %d vs %s %d, %s'
+                 % (me['name'], me['score'], theirs['name'], theirs['score'],
+                    mine))
+        if held:
+            other.push(0x4431, struct.pack('>IB', 0, SN_VERDICT[their_result]))
+        return False
+
+    def sn_endgame_timeout(self):
+        """Release a held `0x4431` whose opponent never reported."""
+        time.sleep(self.args.sn_endgame_wait)
+        with results.LOCK:
+            if not self.endgame_held:
+                return
+            self.endgame_held = False
+            self.endgame = self.endgame_peer = None
+        self.log('     endgame: the opponent never reported -- a win')
+        self.push(0x4431, struct.pack('>IB', 0, SN_VERDICT['win']))
 
     def maybe_start_match(self):
         """Open the PLAY START gate once BOTH clients have run GetStartStaus.
@@ -3612,8 +4298,9 @@ class Session(threading.Thread):
 
         def fire():
             time.sleep(delay)
-            for sess in pair:
-                sess.push(0x4412, b'\x01')
+            for sess, other in (pair, pair[::-1]):
+                sess.push(0x4412, other.sn_ready_body(1) if other.is_sn
+                          else b'\x01')
 
         threading.Thread(target=fire, daemon=True).start()
 
@@ -3740,7 +4427,8 @@ class Session(threading.Thread):
                    if len(payload) >= 8 else 0)
             with WAITING_LOCK:
                 self.pending_join_host = next(
-                    (w for w in LOBBY if w.is_sn and w.player is not None
+                    (w for w in LOBBY if self.same_game(w)
+                     and w.player is not None
                      and w.player.get('id') == tgt), None)
             return
         # 0x4a00 / 0x4a02 -- AUTO SEARCH, the "find me a game" button, as
@@ -3762,7 +4450,14 @@ class Session(threading.Thread):
             if self.is_sn:
                 self.sn_room = parse_sn_createroom(payload)
                 self.log('     created room %s' % (self.sn_room,))
-            if self.args.pair:
+            else:
+                self.x2_room = parse_x2_createroom(payload)
+                self.log('     searching: %s' % (self.x2_room,))
+            # Not SuperNOVA 2. --pair matches two room CREATORS to each other,
+            # which in SuperNOVA 2 would make two owners of two different
+            # rooms; its players meet by joining a room, from the list or the
+            # search, and sn2_join handles both.
+            if self.args.pair and not self.is_sn2:
                 self.pending_pair = True           # deferred; see on_frame
             return
         if opcode == 0x4106:                       # SavePlayerOption
@@ -3838,7 +4533,7 @@ class Session(threading.Thread):
             if peer is not None:
                 self.log('     telling %s we are no longer ready (0x4412 = 0)'
                          % peer.who())
-                peer.push(0x4412, b'\x00')
+                peer.push(0x4412, self.sn_ready_body(0))
             return
         if opcode == 0x4340 and self.is_sn:
             self.sn_part('left the room')
@@ -3908,6 +4603,84 @@ class Session(threading.Thread):
                     state_save()
             self.log('     deleted player file slot %s' % slot)
 
+    def payload_for_sn2(self, resp_opcode, req_payload):
+        """SuperNOVA 2 bodies that differ from SuperNOVA's, or None to fall
+        through to the SuperNOVA ones. Every shape here is from
+        tools/sndispmap.py run over SLUS_216.08."""
+        if resp_opcode in SN2_STATUS_ONLY:
+            return struct.pack('>I', 0)
+        # 0x4333 -- the room this player is in, and who is in it. The
+        # requester is either the room's owner or the player who joined it.
+        if resp_opcode == 0x4333:
+            peer = self.peer
+            if self.sn_room is not None:
+                owner, guest = self, peer
+            else:
+                owner, guest = peer, (self if peer is not None else None)
+            if owner is None or owner.player is None:
+                self.log('!!   0x4333: not in any room we know of')
+                return build_sn2_room_record({}, '', [])
+            members = [build_sn2_member_record(owner.player, 0,
+                                               self.relay_dial
+                                               if owner is not self else None)]
+            if guest is not None and guest.player is not None:
+                members.append(build_sn2_member_record(
+                    guest.player, 1,
+                    self.relay_dial if guest is not self else None,
+                    ready=1 if guest.start_ready else 0))
+            self.log('     room %s of %s: %s'
+                     % ((owner.sn_room or {}).get('id'), owner.who(),
+                        ', '.join(w.who() for w in (owner, guest) if w)))
+            return build_sn2_room_record(owner.sn_room or
+                                         {'id': owner.sn2_id()},
+                                         owner.who(), members)
+        if resp_opcode == 0x4310:
+            with WAITING_LOCK:
+                rooms = [(w.sn_room, w.who()) for w in LOBBY
+                         if w is not self and self.same_game(w)
+                         and w.sn_room is not None]
+            if rooms:
+                self.log('     room list: %s'
+                         % ', '.join('%s(song %d)'
+                                     % (n, (r or {}).get('song', 0))
+                                     for r, n in rooms))
+            return b''.join(roomlist_entry_sn2(r, n) for r, n in rooms)
+        # The room-setting acknowledgements, bare statuses in SuperNOVA, now
+        # carry the setting back. The song and difficulty are echoed; the
+        # other two answer requests whose meaning is unknown, so they echo
+        # what was asked in the width the parser reads.
+        if resp_opcode == 0x4393:                    # 0x0026e0c0: u32, u16
+            return struct.pack('>I', 0) + req_payload[:2].ljust(2, bytes(1))
+        if resp_opcode == 0x4395:                    # 0x0026de10: u32, s32, u8
+            return (struct.pack('>Ii', 0, self.sn2_id())
+                    + req_payload[:1].ljust(1, bytes(1)))
+        if resp_opcode == 0x4391:                    # 0x0026e2b0: u32, u8
+            return struct.pack('>I', 0) + req_payload[:1].ljust(1, bytes(1))
+        if resp_opcode == 0x4381:                    # 0x0026dbe0: u32, s32
+            return struct.pack('>I', 0) + req_payload[:4].ljust(4, bytes(1))
+        # Status, OUR id, and the ready byte for our slot. Served as 0 until a
+        # trace says which of 0x4460 / 0x4470 readies and which un-readies;
+        # what matters first is that the status is not read out of a stale
+        # buffer, which an empty body would do.
+        if resp_opcode in (0x4461, 0x4471):
+            self.log('     0x%04x: answering with our id and ready 0 -- what '
+                     '0x%04x asks for is unidentified, watch the room screen'
+                     % (resp_opcode, resp_opcode - 1))
+            return struct.pack('>IiB', 0, self.sn2_id(), 0)
+        # 0x4431 GetEndgame, 0x0026f790: u32 status, u8, s32, u32, u32, four
+        # u16, u8, u8 -- 27 bytes against SuperNOVA's 5. Not a loop, so the
+        # full length costs nothing even if part of it is read conditionally.
+        if resp_opcode == 0x4431:
+            return struct.pack('>I', 0) + bytes(23)
+        # The online song unlock. SuperNOVA's list unlocks the five songs that
+        # ship locked for online play; SuperNOVA 2 has none (those five are
+        # ordinary songs on its disc), and a song absent from the list is not
+        # locked -- SuperNOVA's tournaments play songs its list never names. So
+        # it gets the empty list. Its tournaments come from sn2_competitions.
+        if resp_opcode == 0x8002:
+            return b''
+        return None
+
     def payload_for(self, resp_opcode, req_opcode=None, req_payload=b''):
         """Body for one response part. Empty unless we have something real."""
         # A 16-byte fixed-width field the client stores at ctx+0xe7 and then
@@ -3921,6 +4694,16 @@ class Session(threading.Thread):
         if resp_opcode in (0x3004, 0x3022, 0x3032):
             if (resp_opcode == 0x3004 and self.args.verify_login
                     and self.login_user and self.login_digest):
+                # First close the account-key gap: the key is only the first 8
+                # bytes of the username, so a different full username sharing
+                # those 8 bytes would otherwise drop into this account. The
+                # owner check rejects that before the password is even looked
+                # at.
+                owner = results.account_claim(self.acct, self.login_user)
+                if owner == 'mismatch':
+                    self.log('!! login rejected: account %s is owned by a '
+                             'different username' % self.acct)
+                    return struct.pack('>i', self.args.login_reject_status)
                 verdict = results.credential_verify(self.login_user,
                                                     self.login_digest)
                 if verdict == 'mismatch':
@@ -4019,6 +4802,10 @@ class Session(threading.Thread):
         # explain why "search for opponent" never calls GetRoomList or
         # GetPlayerList and just advertises a room forever.
         # EXPERIMENT: does a populated block change the matchmaking path?
+        if self.is_sn2:
+            body = self.payload_for_sn2(resp_opcode, req_payload)
+            if body is not None:
+                return body
         if self.is_sn and resp_opcode in SN_STATUS_ONLY:
             return struct.pack('>I', 0)
         if self.is_sn and resp_opcode in SN_STATUS_COUNT:
@@ -4133,12 +4920,13 @@ class Session(threading.Thread):
                         self.who(), pid, text.decode('latin1', 'replace')))
             with WAITING_LOCK:
                 if target is not None:
-                    others = [w for w in LOBBY if w is not self and w.is_sn
-                              and w.who() == target]
+                    others = [w for w in LOBBY if w is not self
+                              and self.same_game(w) and w.who() == target]
                 elif chan:
                     others = [self.peer] if self.peer is not None else []
                 else:
-                    others = [w for w in LOBBY if w is not self and w.is_sn]
+                    others = [w for w in LOBBY if w is not self
+                              and self.same_game(w)]
             for w in others:
                 w.push(0x4513, frame)
             if others:
@@ -4153,7 +4941,7 @@ class Session(threading.Thread):
         # one shelf or the other by its window.
         if resp_opcode in (0x5032, 0x5036) and self.is_sn:
             now = self.args.svr_time or int(time.time())
-            comps = sn_competitions(self.args, now)
+            comps = self.competitions(now)
             if resp_opcode == 0x5032:
                 pick = [c for c in comps if c['start'] <= now < c['end']]
             else:
@@ -4186,7 +4974,8 @@ class Session(threading.Thread):
             tgt = (struct.unpack_from('>i', req_payload, 4)[0]
                    if len(req_payload) >= 8 else 0)
             with WAITING_LOCK:
-                host = next((w for w in LOBBY if w.is_sn and w.player is not None
+                host = next((w for w in LOBBY if self.same_game(w)
+                             and w.player is not None
                              and w.player.get('id') == tgt), None)
             song = ((host.sn_room or {}).get('song', 0)
                     if host is not None and host.sn_room else 0)
@@ -4195,11 +4984,12 @@ class Session(threading.Thread):
             return build_sn_joinreply_record(host.player if host else None, song)
 
         # 0x4431 GetEndgame -- FIVE bytes, u32 status + u8, not a bare status
-        # (parser 0x0026ecc0, which also sets ctx+0x14264 = 3 and
-        # ctx+0x1426c = 2). Served empty it was a short read like the rest of
-        # the in-match handshake.
+        # (parser 0x0026ecc0). Served empty it was a short read like the rest
+        # of the in-match handshake. The u8 is THE VERDICT, 0 win / 1 lose /
+        # 2 draw; hold_sn_endgame works it out and sets sn_verdict.
         if resp_opcode == 0x4431 and self.is_sn:
-            return struct.pack('>I', 0) + bytes([0])
+            verdict, self.sn_verdict = self.sn_verdict, 0
+            return struct.pack('>IB', 0, verdict)
 
         # 0x4b00 -> 0x4b01: the opponent's address pair. The request names a
         # player id; answer with that player's SetMyAddr candidates.
@@ -4207,7 +4997,8 @@ class Session(threading.Thread):
             tgt = (struct.unpack_from('>i', req_payload)[0]
                    if len(req_payload) >= 4 else 0)
             with WAITING_LOCK:
-                who = next((w for w in LOBBY if w.is_sn and w.player is not None
+                who = next((w for w in LOBBY if self.same_game(w)
+                            and w.player is not None
                             and w.player.get('id') == tgt), None)
             if who is None and self.peer is not None:
                 who = self.peer          # asked for someone we cannot see
@@ -4331,7 +5122,8 @@ class Session(threading.Thread):
         if resp_opcode == 0x4310 and self.is_sn:
             with WAITING_LOCK:
                 rooms = [(w.sn_room, w.who()) for w in LOBBY
-                         if w is not self and w.sn_room is not None]
+                         if w is not self and self.same_game(w)
+                         and w.sn_room is not None]
             if not rooms:
                 return b''
             self.log('     room list: %s'
@@ -4342,7 +5134,8 @@ class Session(threading.Thread):
         if resp_opcode == 0x4212:
             with WAITING_LOCK:
                 others = [w for w in LOBBY
-                          if w is not self and w.player is not None]
+                          if w is not self and self.same_game(w)
+                          and w.player is not None]
             if not others:
                 return b''
             self.log('     player list: %s'
@@ -4420,7 +5213,7 @@ class Session(threading.Thread):
         # names the competition by id, so each one gets its own card.
         if resp_opcode == 0x5001 and self.is_sn:
             now = self.args.svr_time or int(time.time())
-            comps = sn_competitions(self.args, now)
+            comps = self.competitions(now)
             comp = (next((c for c in comps if c['id'] == self.sn_comp_sel),
                          None) or (comps[0] if comps else None))
             if comp is None:
@@ -4532,11 +5325,7 @@ class Session(threading.Thread):
             # nameless "NO DATA". Same bug as the 0x4212 player list, one
             # message over.
             if self.is_sn:
-                return b''.join(
-                    ranking_entry_sn(i + 1, w.who(),
-                                     (w.player or {}).get('id', 0),
-                                     (w.player or {}).get('dancer', 0))
-                    for i, w in enumerate(rows))
+                return self.sn_ranking_body(rows)
             if self.args.stat_probe:
                 return b''.join(
                     ranking_entry(i + 1, w.who(),
@@ -4592,6 +5381,16 @@ class Session(threading.Thread):
             if self.is_sn:
                 return playerfile_list_sn(files)
             return playerfile_list(files, probe=self.args.stat_probe)
+        # SuperNOVA's SvrInfo is the Information reader, see sn_info_bodies.
+        # The operator page wins when it has entries, then --sn-info.
+        if resp_opcode == 0x200a and self.is_sn and self.args.serve_svrinfo:
+            items = (content.load().get('info') or self.args.sn_info or [])
+            bodies = sn_info_bodies(items, self.args.sn_news_wrap)
+            self.log('     information: %d entr%s'
+                     % (len(bodies), 'y' if len(bodies) == 1 else 'ies'))
+            return bodies
+        if resp_opcode == 0x2009 and self.is_sn and self.args.serve_svrinfo:
+            return struct.pack('>I', 0)      # BEGIN: u32 status (0x00271530)
         if resp_opcode == 0x200a and self.args.serve_svrinfo:
             return svrinfo_record(
                 ident=self.args.probe_info_id,
@@ -4603,7 +5402,7 @@ class Session(threading.Thread):
         if resp_opcode == 0x0004:
             # u32 BE status -> ctx+0x4900. 0 = success.
             return struct.pack('>I', self.args.hello_status & 0xffffffff)
-        if resp_opcode == 0x2002 and self.local_port in self.args.sn_ports:
+        if resp_opcode == 0x2002 and self.is_sn:
             # SuperNOVA's SvrList BEGIN is NOT empty -- Extreme 2's is. This is
             # the first real protocol divergence found between the two games.
             #
@@ -4647,7 +5446,10 @@ class Session(threading.Thread):
                     # would have to be guessed from behaviour. 19570 is the
                     # second half of the u16 pair at 0x002d013c, whose purpose
                     # was otherwise unexplained.
-                    port=(self.args.sn_svr_port if self.is_sn
+                    # SuperNOVA 2 likewise, on the second half of its own
+                    # pair at 0x00301260.
+                    port=(self.args.sn2_svr_port if self.is_sn2
+                          else self.args.sn_svr_port if self.is_sn
                           else (self.args.svr_port or self.args.port)),
                     b=(self.args.probe_b if self.args.probe_b
                        else live_users()),
@@ -4743,6 +5545,15 @@ def main():
                          '(Extreme 2 keeps --svr-port). Must be in --also-listen '
                          'AND in --sn-ports, or the account connection lands '
                          'somewhere the game cannot be identified.')
+    ap.add_argument('--sn2-ports', default='29573,29570',
+                    help='ports on which the peer is SuperNOVA 2. Its service '
+                         'table (0x00301260) packs 29573 (gate) and 29570; '
+                         'everything else about it is SuperNOVA with '
+                         'overrides.')
+    ap.add_argument('--sn2-svr-port', type=int, default=29570,
+                    help='port advertised in the SvrList to SuperNOVA 2 '
+                         'clients. Must be in --also-listen AND in '
+                         '--sn2-ports.')
     ap.add_argument('--sn-svrlist-status', type=int, default=0,
                     help="u32 BE result code in SuperNOVA's 0x2002 SvrList "
                          "BEGIN -> ctx+0x2350. 0 = success.")
@@ -4919,16 +5730,17 @@ def main():
                     help='seconds to wait before each experimental push, so it '
                          'cannot overwrite the reply an in-flight RPC is still '
                          'polling for (netwk+0x8d8 is checked once per frame)')
-    ap.add_argument('--match-tail', default='0,0,0,0',
-                    help='the four tail fields of the 0x44b0 match record, in '
-                         'WIRE order: R+0x00 (u8) is the ONLINE GAME MODE, 0..3 '
-                         '(the client permutes them to 1,3,2,4 in '
-                         '_DAT_006f1698); R+0x01 (u8) is read by nothing; '
-                         'R+0x04 (u16) is THE SONG THE MATCH PLAYS, a table '
-                         'index bounded 0..%d and clamped here; R+0x02 (u8) is '
-                         'read by nothing. All zero is what every match so far '
-                         'has run under -- mode 1, song 1. Change ONE at a '
-                         'time.' % (RC_SONG_IDS - 1))
+    ap.add_argument('--match-tail', default='',
+                    help='Extreme 2: FIX the four tail fields of the 0x44b0 '
+                         'match record for every match, in WIRE order: '
+                         'R+0x00 (u8) the win condition, 0 score / 1 combo / '
+                         '2 survival; R+0x01 (u8) the recipient\'s difficulty; '
+                         'R+0x04 (u16) the song, a table index bounded 0..%d '
+                         'and clamped here; R+0x02 (u8) the opponent\'s '
+                         'difficulty. Empty (the default) lets the server '
+                         'decide each match from what the two players picked '
+                         '(x2_match_settings). For testing only.'
+                         % (RC_SONG_IDS - 1))
     ap.add_argument('--rule-mask', default='1,1,1',
                     help='the three 0x441e GetRuleMask flags -- score, combo, '
                          'survival -- which are the head-to-head win conditions '
@@ -4969,6 +5781,13 @@ def main():
                          'for both. Omit entirely and no 0x3122 frame is '
                          'sent at all, which is what the client wants for '
                          'an empty feed.')
+    ap.add_argument('--sn-info', action='append', default=None,
+                    metavar='TITLE|BODY',
+                    help='SuperNOVA only: one entry for the Information '
+                         'reader (0x200a, the gate phase). Repeat for more, '
+                         'up to %d. The operator page\'s "info" list wins '
+                         'when it has entries. With neither, one default '
+                         'welcome entry is served.' % 10)
     ap.add_argument('--sn-news-wrap', type=int, default=40,
                     help='SuperNOVA only: hard-wrap news bodies at this '
                          'many characters. The client does NOT wrap -- a '
@@ -5040,6 +5859,17 @@ def main():
                     help='SuperNOVA: a JSON list of competitions (see '
                          'sn_competitions). Default: sn_competitions.json '
                          'beside the state file, used only if it exists.')
+    ap.add_argument('--sn2-comp', default='auto', choices=('auto', 'none'),
+                    help='SuperNOVA 2: "auto" (default) runs the generated '
+                         'weekly cup and 28-day marathon from '
+                         'schedule.sn2_auto_competitions; "none" serves no '
+                         'competitions. A sn2_competitions.json beside the '
+                         'state file overrides either.')
+    ap.add_argument('--sn2-comp-file', default='',
+                    help='SuperNOVA 2: a JSON list of competitions in the '
+                         'sn_competitions format. Default: '
+                         'sn2_competitions.json beside the state file, used '
+                         'only if it exists.')
     ap.add_argument('--sn-addr-delay', type=float, default=0.5,
                     help='SuperNOVA: seconds between telling the host '
                          'that someone joined (0x4325) and telling it '
@@ -5073,6 +5903,14 @@ def main():
                          'Holding is what starts the two peer connects '
                          'together (see hold_sn_start); this restores '
                          'the old behaviour for comparison.')
+    ap.add_argument('--sn-endgame-wait', type=float, default=8.0,
+                    help='SuperNOVA: the longest to hold a player\'s '
+                         '0x4431 GetEndgame reply waiting for the '
+                         'opponent\'s score. The reply carries the '
+                         'WIN/LOSE verdict, so it cannot go out until both '
+                         'scores are in (see hold_sn_endgame). If the '
+                         'opponent never reports, the player is told they '
+                         'won.')
     ap.add_argument('--sn-match-song', type=int, default=0,
                     help='SuperNOVA only: the song id in the match push, the '
                          'u16 that lands at match record +0x1a. NOT put '
@@ -5093,6 +5931,19 @@ def main():
     ap.add_argument('--state-file', default='',
                     help='JSON file holding the two player-file slots; defaults '
                          'to state.json beside --keyfile')
+    ap.add_argument('--live-file', default='',
+                    help='where the lobby snapshot for the boards is written; '
+                         'defaults to live.json beside the state file. "off" '
+                         'turns it off')
+    ap.add_argument('--live-every', type=float, default=5.0, metavar='S',
+                    help='rewrite --live-file every S seconds')
+    ap.add_argument('--admin-port', type=int, default=0, metavar='PORT',
+                    help='serve the OpenLobby admin protocol on this port '
+                         '(adminport.py), with the token in DDR_ADMIN_TOKEN. '
+                         '0, the default, leaves it off')
+    ap.add_argument('--admin-bind', default='127.0.0.1', metavar='ADDR',
+                    help='address for --admin-port. Anything but loopback '
+                         'needs DDR_ADMIN_TOKEN')
     args = ap.parse_args()
     args.match_tail = [int(x, 0) for x in args.match_tail.split(',') if x.strip()]
     args.rc_flags = [int(x, 0) for x in args.rc_flags.split(',') if x.strip()]
@@ -5125,6 +5976,8 @@ def main():
                                'state.json'))
 
     args.sn_ports = set(int(p) for p in str(args.sn_ports).split(',') if p.strip())
+    args.sn2_ports = set(int(p) for p in str(args.sn2_ports).split(',')
+                         if p.strip())
     args.sn_rule_mask = [int(x) for x in str(args.sn_rule_mask).split(',') if x.strip()]
 
     keybox = {'key': None}
@@ -5174,11 +6027,37 @@ def main():
     if args.stat_probe:
         globals()['PROBE_SMALL'] = args.stat_probe_small
         print(probe_legend(), flush=True)
-    print('point dx2gate01.konamionline.com at this machine\n', flush=True)
+    if args.live_file != 'off':
+        live = args.live_file or os.path.join(
+            os.path.dirname(STATE_PATH) or '.', 'live.json')
+        start_live_writer(live, max(1.0, args.live_every), args)
+        print('lobby snapshot for the boards: %s' % live, flush=True)
+    if args.admin_port:
+        import adminport
+        try:
+            adminport.serve(adminport.Hooks(sys.modules[__name__], args),
+                            args.admin_bind, args.admin_port,
+                            os.environ.get('DDR_ADMIN_TOKEN', ''),
+                            log=lambda m: print(m, flush=True))
+        except (OSError, ValueError) as e:  # the game runs without it
+            print('!! admin port not started: %s' % e, flush=True)
+    if os.environ.get('GAMELINK_SECRET'):
+        # The OpenLobby website's account API: link a DDR login to a website
+        # account, and set its password from there. See ddrlink.py.
+        try:
+            import ddrlink
+            ddrlink.start(os.path.dirname(STATE_PATH) or '.',
+                          log=lambda m: print(m, flush=True))
+        except Exception as e:             # never keep the gate from starting
+            print('!! account link not started (%r)' % (e,), flush=True)
+    print('point dx2gate01.konamionline.com (Extreme 2, SuperNOVA) and '
+          'game.ddr.konamionline.com (SuperNOVA 2) at this machine\n',
+          flush=True)
     while True:
         ready, _, _ = select.select(listeners, [], [])
         for s in ready:
             conn, addr = s.accept()
+            keepalive(conn)
             local_port = s.getsockname()[1]
             Session(conn, addr, args, keybox, local_port).start()
 

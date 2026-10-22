@@ -18,6 +18,11 @@ slots -- they are ours to choose:
     /ddrsn/reg/reg.html         account registration      (on demand)
     /ddrsn/reg/chg.html         password change           (on demand)
 
+SuperNOVA 2 has the same five URLs on its own host, www.ddr.konamionline.com,
+under /ddrsn2/, and the patch maps them the same way: /ddrsn2/oua/oua.txt,
+/ddrsn2/oua/pia.txt, /V2/info/, /ddrsn2/reg/reg.html and /ddrsn2/reg/chg.html.
+Its registration form posts the same fields. The documents are shared.
+
 Every request is logged in full, including ones we do not recognise, because
 what else the client asks for is still unknown -- and an unknown path answered
 with 404 is far easier to spot in a log than a silent timeout.
@@ -27,6 +32,8 @@ Pure stdlib, like gate.py. No framework, nothing to build.
 import argparse, os, socket, sys, threading, datetime, urllib.parse
 
 import admin
+import content
+import publicaddr
 import schedule
 
 OUA = """DANCE DANCE REVOLUTION SUPERNOVA
@@ -84,10 +91,18 @@ ROUTES = {
     '/VW/info':           ('text/plain', INFO),
     '/ddrsn/reg/reg.html': ('text/html', REG),
     '/ddrsn/reg/chg.html': ('text/html', CHG),
+    # SuperNOVA 2 -- see the module docstring.
+    '/ddrsn2/oua/oua.txt': ('text/plain', OUA),
+    '/ddrsn2/oua/pia.txt': ('text/plain', PIA),
+    '/V2/info/':           ('text/plain', INFO),
+    '/V2/info':            ('text/plain', INFO),
+    '/ddrsn2/reg/reg.html': ('text/html', REG),
+    '/ddrsn2/reg/chg.html': ('text/html', CHG),
 }
 
 
-REG_POSTS = ('/ddrsn/reg/reg.html', '/ddrsn/reg/chg.html')
+REG_POSTS = ('/ddrsn/reg/reg.html', '/ddrsn/reg/chg.html',
+             '/ddrsn2/reg/reg.html', '/ddrsn2/reg/chg.html')
 
 # The six fields SuperNOVA posts, in wire order. Built in DATA08 from the format
 # strings at 0x00b4cf16: "name=%s" "&passwd=%s" "&email=%s" "&region=%d"
@@ -158,6 +173,17 @@ def reg_log(addr, path, body, args):
               % (stamp(), len(recs), args.reg_file), flush=True)
     except Exception as e:
         print('%s   could not save registration: %s' % (stamp(), e), flush=True)
+
+
+def admin_allowed(ip, args):
+    """Whether the operator page answers a client at `ip`.
+
+    This port has to be open to the internet for SuperNOVA, and the page's only
+    protection is a token in the URL, sent in the clear. So by default it
+    answers only addresses that are not on the internet: the LAN, a tailnet,
+    this machine. --admin-from any lifts that.
+    """
+    return args.admin_from == 'any' or not publicaddr.is_global(ip)
 
 
 def serve(conn, addr, args):
@@ -234,8 +260,14 @@ def serve(conn, addr, args):
 
         # The operator page. Token-gated and on the same port, because the game
         # only ever asks for the handful of paths above and one listener is one
-        # less thing to expose or explain.
-        if args.admin and path.startswith('/admin'):
+        # less thing to expose or explain. Refused to internet addresses unless
+        # --admin-from any, and a refused request is answered as if the page
+        # did not exist.
+        if (args.admin and path.startswith('/admin')
+                and not admin_allowed(addr[0], args)):
+            print('%s %s   /admin refused: %s is an internet address'
+                  % (stamp(), tag, addr[0]), flush=True)
+        elif args.admin and path.startswith('/admin'):
             form = {}
             if body:
                 form = urllib.parse.parse_qs(body.decode('latin1', 'replace'),
@@ -322,8 +354,12 @@ def main():
                     help='decimal body returned for a registration POST. The '
                          'client strtol()s it and the caller tests it with beqz, '
                          'so 0 = success. MUST render to fewer than 10 bytes.')
-    ap.add_argument('--reg-file', default='/state/registrations.json',
-                    help='where to append posted registrations (empty to disable). '
+    ap.add_argument('--state-dir', default='/state',
+                    help='the folder shared with the gate: content.json, the '
+                         'operator token and, by default, registrations.json')
+    ap.add_argument('--reg-file', default=None,
+                    help='where to append posted registrations (empty to disable; '
+                         'default registrations.json in --state-dir). '
                          'Passwords and email are redacted unless '
                          '--reg-keep-secrets is also given.')
     ap.add_argument('--admin', action='store_true', default=True,
@@ -331,6 +367,11 @@ def main():
                          '(default on; --no-admin turns it off)')
     ap.add_argument('--no-admin', dest='admin', action='store_false',
                     help=argparse.SUPPRESS)
+    ap.add_argument('--admin-from', choices=('lan', 'any'), default='lan',
+                    help='who may use the operator page. "lan" (default) is '
+                         'LAN, tailnet and loopback addresses only, so it stays '
+                         'private while this port is open to the internet for '
+                         'SuperNOVA. "any" is anyone with the token.')
     ap.add_argument('--admin-token', default='',
                     help='token the operator page requires in ?t=. Generated '
                          'and stored in the state directory if not given.')
@@ -341,8 +382,12 @@ def main():
                          'people can reach this collects their passwords, and '
                          'nothing ever reads the file back.')
     args = ap.parse_args()
+    content.DEFAULT_PATH = os.path.join(args.state_dir, 'content.json')
+    if args.reg_file is None:
+        args.reg_file = os.path.join(args.state_dir, 'registrations.json')
     if args.admin:
-        args.admin_token = args.admin_token or admin.load_token()
+        args.admin_token = args.admin_token or admin.load_token(
+            os.path.join(args.state_dir, 'admin_token'))
     if len('%d' % args.reg_result) >= 10:
         sys.exit('--reg-result %d is %d bytes; the client rejects any '
                  'registration response of 10 bytes or more (-10015)'
@@ -355,15 +400,17 @@ def main():
     print('ddr-web listening on %s:%d' % (args.host, args.port), flush=True)
     if args.admin:
         wk, secs = admin_clock()
-        print('operator page:  http://<this-host>:%d/admin?t=%s'
-              % (args.port, args.admin_token), flush=True)
+        print('operator page:  http://<this-host>:%d/admin?t=%s  (%s)'
+              % (args.port, args.admin_token,
+                 'LAN and tailnet only' if args.admin_from == 'lan'
+                 else 'anyone with the token'), flush=True)
         print('  week %d of 60, %d:%02d left. Nothing needs setting; the '
               'challenge rotates on its own.'
               % (wk, secs // 3600, (secs // 60) % 60), flush=True)
     for p in sorted(ROUTES):
         print('   %s' % p, flush=True)
-    print('point dx2web.konamionline.com and info.service.konamionline.com here',
-          flush=True)
+    print('point dx2web.konamionline.com, www.ddr.konamionline.com and '
+          'info.service.konamionline.com here', flush=True)
 
     while True:
         conn, addr = s.accept()

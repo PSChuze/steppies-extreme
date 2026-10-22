@@ -1,13 +1,13 @@
 # Patching the disc
 
-Both games authenticate against Sony's DNAS before they will talk to Konami's
+All three games authenticate against Sony's DNAS before they will talk to Konami's
 servers. Sony shut DNAS down permanently, so the check can never pass, on an
 emulator or on real hardware. DNAS tickets are signed by Sony, so no server can
 answer for it either, so the verdict has to be overridden on the client. That is
 the whole reason a patch exists.
 
-The patch changes 4 bytes in Extreme 2 and 160 bytes in SuperNOVA. It touches
-nothing else.
+The patch changes 4 bytes in Extreme 2, 160 bytes in SuperNOVA and 156 in
+SuperNOVA 2. It touches nothing else.
 
 ## What you need
 
@@ -18,8 +18,12 @@ and never will; the patch is a difference, and it is useless without the disc.
 |---|---|---|---|
 | Extreme 2 (USA) | SLUS-21174 | `b2087cecb653aafdc09ba389169e8f25148f0d6c` | 3917185024 |
 | SuperNOVA (USA) | SLUS-21377 | `810d0b68b2fdbebf27cf80380f4427c63e712084` | 1574731776 |
+| SuperNOVA 2 (USA) | SLUS-21608 | `b2036b059c4a283a6bff2413c23e0901ec3070ea` | 1317699584 |
 
-Those are the Redump dumps. Check yours first:
+The first two are the Redump dumps. The SuperNOVA 2 hash is the dump the patch
+was built against and has not been checked against Redump; `isopatch.py` only
+warns about a different hash, and checks every patched byte either way. Check
+yours first:
 
 ```sh
 sha1sum "Dance Dance Revolution SuperNOVA (USA).iso"     # Linux / macOS / Git Bash
@@ -64,13 +68,21 @@ identical to the one the `.xdelta` gives you.
 The patched image is a normal disc image. Burn it to DVD-R, or load it over the
 network or from USB/HDD with Open PS2 Loader, the same as any other backup.
 
-Do not try this with a cheat device on SuperNOVA. CodeBreaker, Action
-Replay and OPL's built-in cheat engine all write to memory every frame, and
-SuperNOVA's DNAS2 code lives at `0x00a46000`, an overlay slot shared by
-`DATA03.BIN` (`net_mas4`) and `DATA04.BIN` (`netlby_mas4`). A repeating write
-there corrupts whichever module happens to be resident. This is why SuperNOVA
-needs a disc patch and not a code. Extreme 2's patch is in the always-mapped
-main ELF and does not have this problem.
+If you would rather boot the original disc, the same edits exist as cheat
+codes: `patches/cheats/DDR-Online.txt`, and [cheats.md](cheats.md) for how to
+use them. That is the route for a real disc in the drive on a FreeMcBoot
+console, which no disc patch can help with.
+
+A plain, unconditional code cannot do SuperNOVA or SuperNOVA 2, which is worth
+knowing before writing one. SuperNOVA's DNAS2 code lives at `0x00a46000`, an
+overlay slot that nine modules take turns in, `DATA03.BIN` (`net_mas4`) and
+`DATA04.BIN` (`netlby_mas4`) among them; SuperNOVA 2's lives at `0x00976000`,
+shared the same way by `net_rel4` and `netlby_rel4`. A code that writes there
+every frame lands on whichever module happens to be resident and corrupts it.
+The codes in this repository test the resident module's signature first and
+write only when it is the right one, which a pnach has no way to express.
+Extreme 2's patch is in the always-mapped main ELF and does not have this
+problem.
 
 ## PCSX2
 
@@ -87,9 +99,10 @@ Two things that will silently waste your time:
 - The filename must be `<serial>_<CRC>.pnach`. A bare `<CRC>.pnach` is the
   PCSX2 1.6 convention and is ignored without a message.
 
-There is no working pnach for SuperNOVA, for the overlay reason above.
+There is no working pnach for either SuperNOVA, for the overlay reason above.
 `patches/SLUS-21377_23EFA2AF.pnach` is kept only as a record of what that
-address really is; it is a no-op.
+address really is; it is a no-op. The conditional cheat codes in
+[cheats.md](cheats.md) do work, but PCSX2 does not read that format.
 
 ## After patching
 
@@ -99,8 +112,8 @@ games find theirs by DNS, so you also need the console's DNS to answer for the
 and [server/README.md](../server/README.md) for a working resolver setup.
 
 Extreme 2 additionally needs a network configuration on the memory card and
-ships no tool to create one. SuperNOVA bundles Sony's configuration utility, so
-build the configuration in SuperNOVA first.
+ships no tool to create one. Both SuperNOVAs bundle Sony's configuration
+utility, so build the configuration in one of them first.
 
 ## Rebuilding the patches
 

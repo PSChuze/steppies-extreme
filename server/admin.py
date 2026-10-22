@@ -18,6 +18,7 @@ Do not expose this port to the internet.
 import html
 import os
 import secrets
+import time
 import urllib.parse
 
 import content
@@ -74,6 +75,7 @@ def render(tok, status, week, secs, generated):
     c = content.load()
     news = c.get('news') or []
     rc = c.get('rc') or {}
+    info = c.get('info') or []
     e = html.escape
     q = '?t=' + urllib.parse.quote(tok)
 
@@ -106,6 +108,20 @@ def render(tok, status, week, secs, generated):
                '<p>Title<br><input name=title maxlength=64 required></p>'
                '<p>Body<br><textarea name=body maxlength=1024></textarea></p>'
                '<button>Add news item</button></form>' % q)
+
+    out.append('<h2>Information</h2>')
+    out.append('<p class=k>Shown on the SuperNOVA Information screen. None set '
+               'serves the built-in text.</p>')
+    for i, n in enumerate(info):
+        out.append('<div class=row><b>%s</b><br>%s<br>'
+                   '<form class=inline method=post action="/admin/info/delete%s">'
+                   '<input type=hidden name=i value="%d">'
+                   '<button class=d>delete</button></form></div>'
+                   % (e(n.get('title', '')), e(n.get('body', '')), q, i))
+    out.append('<form method=post action="/admin/info%s">'
+               '<p>Title<br><input name=title maxlength=64 required></p>'
+               '<p>Body<br><textarea name=body maxlength=1024></textarea></p>'
+               '<button>Add information item</button></form>' % q)
 
     out.append('<h2>Ranking challenge</h2>')
     out.append('<p class=k>Leave a field blank to keep the generated value. '
@@ -171,6 +187,7 @@ def handle(method, path, query, form, tok, week, secs, generated):
     c = content.load()
     news = list(c.get('news') or [])
     rc = dict(c.get('rc') or {})
+    info = list(c.get('info') or [])
     msg = ''
     if base == '/admin/news':
         title = (form.get('title', [''])[0] or '').strip()[:64]
@@ -183,6 +200,23 @@ def handle(method, path, query, form, tok, week, secs, generated):
             i = int(form.get('i', ['-1'])[0])
             if 0 <= i < len(news):
                 msg = 'Deleted %s.' % news.pop(i).get('title', '')
+        except ValueError:
+            pass
+    elif base == '/admin/info':
+        title = (form.get('title', [''])[0] or '').strip()[:64]
+        body = (form.get('body', [''])[0] or '').strip()[:1024]
+        if title:
+            # Stamp the publish time so the reader shows a real date. Without
+            # it the gate dates the item at server start, so every item reads
+            # the same and the date moves on each restart.
+            info.append({'title': title, 'body': body,
+                         'time': int(time.time())})
+            msg = 'Added %s.' % title
+    elif base == '/admin/info/delete':
+        try:
+            i = int(form.get('i', ['-1'])[0])
+            if 0 <= i < len(info):
+                msg = 'Deleted %s.' % info.pop(i).get('title', '')
         except ValueError:
             pass
     elif base == '/admin/rc/clear':
@@ -207,7 +241,7 @@ def handle(method, path, query, form, tok, week, secs, generated):
     else:
         return ('404 Not Found', 'text/plain', 'No such admin page', None)
 
-    content.save({'news': news, 'rc': rc or None})
+    content.save({'news': news, 'rc': rc or None, 'info': info})
     where = '/admin' + q + ('&m=' + urllib.parse.quote(msg) if msg else '')
     return ('303 See Other', 'text/html', '<a href="%s">ok</a>' % html.escape(where),
             where)

@@ -68,6 +68,12 @@ ATTR_NAMES = {
 CHANGE_IP = 0x04
 CHANGE_PORT = 0x02
 
+# Linux can report which of our addresses a datagram was sent to, which is the
+# address that client can reach us on. Elsewhere the best guess is the interface
+# the default route uses (local_address()).
+PKTINFO = getattr(socket, 'IP_PKTINFO',
+                  8 if sys.platform.startswith('linux') else None)
+
 
 def parse(data):
     """-> (msg_type, transaction_id, {attr_type: value}) or None."""
@@ -137,6 +143,18 @@ def local_address():
         s.close()
 
 
+def receive(s):
+    """-> (data, source, the address of ours it was sent to or None)."""
+    if PKTINFO is None or not hasattr(s, 'recvmsg'):
+        data, src = s.recvfrom(2048)
+        return data, src, None
+    data, anc, _, src = s.recvmsg(2048, socket.CMSG_SPACE(12))
+    for level, kind, val in anc:
+        if level == socket.IPPROTO_IP and kind == PKTINFO and len(val) >= 12:
+            return data, src, socket.inet_ntoa(val[8:12])   # ipi_addr
+    return data, src, None
+
+
 def main():
     ap = argparse.ArgumentParser(description='Classic STUN (RFC 3489) responder')
     ap.add_argument('--host', default='0.0.0.0')
@@ -161,6 +179,11 @@ def main():
     for p in (a.port, a.alt_port):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if PKTINFO is not None:
+            try:
+                s.setsockopt(socket.IPPROTO_IP, PKTINFO, 1)
+            except OSError:
+                pass                # receive() then falls back to the guess
         s.bind((a.host, p))
         socks[p] = s
     local = a.host if a.host != '0.0.0.0' else local_address()
@@ -172,15 +195,16 @@ def main():
         print('advertising %s in SOURCE/CHANGED-ADDRESS\n' % a.advertise,
               flush=True)
     else:
-        print('advertising %s in SOURCE/CHANGED-ADDRESS to LAN clients; '
-              'internet clients get the public address, %s\n'
-              % (local, public.describe()), flush=True)
+        print('advertising in SOURCE/CHANGED-ADDRESS: to LAN clients the '
+              'address each one reached us on (else %s); to internet clients '
+              'the public address, %s\n' % (local, public.describe()),
+              flush=True)
 
     while True:
         ready, _, _ = select.select(list(socks.values()), [], [])
         for s in ready:
             try:
-                data, src = s.recvfrom(2048)
+                data, src, dest = receive(s)
             except OSError:
                 continue
             recv_port = s.getsockname()[1]
@@ -219,7 +243,7 @@ def main():
                 print('        change-port -> replying from :%d' % out_port, flush=True)
 
             other_port = a.alt_port if out_port == a.port else a.port
-            adv = a.advertise or public.for_client(src[0], local)
+            adv = a.advertise or public.for_client(src[0], dest or local)
             resp = build_response(tid, src[0], src[1], adv, out_port, adv, other_port)
             try:
                 out_sock.sendto(resp, src)

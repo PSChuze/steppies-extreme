@@ -2,10 +2,11 @@
 """Apply this project's disc patches to your own copy of the game.
 
 Reads patches/patches.json, works out which game the image is by its boot ELF,
-and applies every edit for that game.  Handles both titles:
+and applies every edit for that game.  Handles all three titles:
 
-  Extreme 2  (SLUS-21174)  DNAS bypass in SLUS_211.74
-  SuperNOVA  (SLUS-21377)  DNAS2 bypass in DATA03.BIN, service URLs in SLUS_213.77
+  Extreme 2    (SLUS-21174)  DNAS bypass in SLUS_211.74
+  SuperNOVA    (SLUS-21377)  DNAS2 bypass in DATA03.BIN, service URLs in SLUS_213.77
+  SuperNOVA 2  (SLUS-21608)  DNAS2 bypass in DATA03.BIN, service URLs in SLUS_216.08
 
 Every edit is SIZE-NEUTRAL, so each file's sectors are overwritten in place and
 the ISO9660 layout -- every LBA the game hardcodes -- is left untouched.  A full

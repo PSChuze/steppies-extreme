@@ -1,7 +1,8 @@
 # Protocol
 
-Wire protocol for the online modes of DDR Extreme 2 (SLUS-21174) and
-DDR SuperNOVA (SLUS-21377).
+Wire protocol for the online modes of DDR Extreme 2 (SLUS-21174),
+DDR SuperNOVA (SLUS-21377) and DDR SuperNOVA 2 (SLUS-21608). SuperNOVA 2 is
+SuperNOVA with changes, and [has its own section](#supernova-2).
 
 The two games share a backend, a frame format and an obfuscation key. Their
 payloads are not interchangeable, and the differences are not always visible
@@ -398,24 +399,47 @@ immediately after a reply is lost.
 
 #### The `0x44b0` tail: what the server decides about the match
 
-Four fields follow the endpoints. Two of them are the match settings and two
-are read by nothing. The bridge `FUN_00235d40` is the only consumer of this
-record; it copies the fields into globals, `FUN_00237270` assembles a play
-block from them and `FUN_00233f60` consumes it.
+Four fields follow the endpoints, and all four are the match settings. The
+bridge `FUN_00235d40` copies them into globals, `FUN_00237270` assembles a
+play block from them and `FUN_00233f60` consumes it. The bridge's last call,
+`FUN_002379e0`, reads the two difficulty bytes straight out of the record,
+which is why an earlier pass that only read the bridge body missed them.
 
 | wire | size | struct | is |
 |---|---|---|---|
-| `+0x38` | u8 | `R+0x00` | **game mode**, `0..3`, permuted to `1,3,2,4` in `[0x006f1698]` |
-| `+0x39` | u8 | `R+0x01` | read by nothing |
+| `+0x38` | u8 | `R+0x00` | **win condition**: 0 score, 1 combo, 2 survival |
+| `+0x39` | u8 | `R+0x01` | **the recipient's difficulty** → `DAT_0104c01e`, play-block player 0 |
 | `+0x3a` | u16 | `R+0x04` | **the song the match plays** |
-| `+0x3c` | u8 | `R+0x02` | read by nothing |
+| `+0x3c` | u8 | `R+0x02` | **the opponent's difficulty** → `DAT_0104c076`, player 1 |
+
+Difficulty is 0 Light, 1 Standard, 2 Heavy, 3 Challenge. 4 means "the other
+player's". If both are 4, the client's fallback gives Challenge. If a song has
+no chart at the chosen level, `FUN_002379e0` steps down to the nearest one it
+has. The play loop (`FUN_00236440`) ends a match early on a fail flag only in
+modes 1 and 2, which is why those are read as combo and survival.
+
+The players choose these values, and they reach the server in CreateRoom.
+`0x4330` is 34 bytes: a fixed 32-byte string (`ddrex2`), then two u8 values
+from the head-to-head options menu (`FUN_001f0690`):
+
+| wire | menu row | values | is |
+|---|---|---|---|
+| `+0x20` | 1 | 0 / 1 / 2 / 3 (labels 197 / 198 / 199 / 196) | win condition, 3 = any |
+| `+0x21` | 0 | 0 / 1 / 2 / 4 (labels 192 / 193 / 194 / 196) | difficulty, 4 = any |
+
+The win-condition row only offers values whose bit is set in the `0x441e`
+rule mask. No request names a song, so the server picks one. `gate.py` pairs
+only searches whose win conditions agree (or where one side chose any). It
+draws the song at random from the ids the Ranking Challenge has proven safe,
+and gives each player their own difficulty (`x2_match_settings`). Until
+2026-09 the server sent `0,0,0,0`, so every match was song 0 on Light.
 
 The song is a table index: `FUN_001e7060` reads `*(s16 *)(0x002e7850 + id*2)`,
 a table with 80 valid entries that returns −1 for a negative index, and the
 result **plus one** becomes `dance_num`. When the lookup fails the client prints
 `reset dance_num : %d < %d` and forces `dance_num = 1`, which is the client
 naming the field, and also means a bad index here is recoverable rather than
-fatal. Everything this server has run used `0,0,0,0`: mode 1, song 1.
+fatal.
 
 `[0x006f1698]` is the global that was once mislabelled a peer count. Every store
 to it is in the match code, and this is where its value comes from.
@@ -679,7 +703,9 @@ fails immediately if either direction's entry has no bit above `0x3`, which
 covers code 2 on either side and pairs such as `0x50`/`0x50`. gate.py sends the
 peer's word as 0 in `0x4325` and `0x4a13`. Against `0xb1` that gives `c0` and
 `c3`, which pass, so it is not the blocker. Serving the real value would mean
-finding where the client reports it.
+finding where the client reports it. Any value not in that list is treated as
+code 2, which is why putting a song id in the room record's NAT field blocked
+joins (see "Joining from the room list").
 
 ### Inside a SuperNOVA room: settings, chat, leaving, friends
 
@@ -701,6 +727,29 @@ auto-searcher matched into an existing room must therefore get `0x4a04`.
 `0x4a13` made it a second owner of a room the server never listed, so when the
 real owner left it kept an "open" room nobody could find.
 `--sn-search-push` (default `0x4a04`) controls this.
+
+#### Joining from the room list
+
+A `0x4310` room record carries the room's song at wire `+4` and the **owner's
+NAT word** at wire `+32` (struct `+0x0c`). An earlier reading took `+32` for a
+second song field, and the server put the song there.
+
+The row builder `FUN_00a625f0` runs `0x00277d70(own NAT word, entry+0x0c)`,
+the same NAT table the peer connect reads, and the join handler
+`FUN_00a63ad0` refuses a row whose verdict is 3 without sending anything.
+`0x00277d70` puts any value it does not recognise in the index of code 2, and
+code 2 fails against every other code. Song 0 is a valid code, so a room made
+on the default song could be joined, and a room made on any other song (6, 11,
+53, random 90, ...) listed normally but could not be entered. Players worked
+around it by making the room on defaults and changing the song afterwards,
+because that goes out as `0x43b2` and never touches the record. The server log
+shows no `0x4323` at all for such rooms.
+
+The song banner is drawn from `+0x82`, which is filled from wire `+4`, so the
+song does not need to be at `+32`. The server sends word 0 there: every joiner
+code except 2 then gets verdict 2, which can be joined. On a join,
+`FUN_00a648d0` copies the word into slot A's NAT field (`+0x338`), and 0 is
+also the peer word `0x4325` and `0x4a13` carry.
 
 #### Room settings
 
@@ -730,6 +779,27 @@ opponent `0x4412 = 0` to put the light out.
 record at `ctx+0x141b0` and raises `ctx+0x14300`, and both room scenes then
 clear the other player's slot. The server sends it to the remaining player on
 `0x4340` OutRoom and when a connection drops.
+
+#### The result: `0x4431` decides who won
+
+Each player sends `0x4430` when the song ends. It is Extreme 2's 36-byte
+record in the same field order (builder `0x0026ed90`), score first. The reply
+`0x4431` is `u32 status, u8`, and the u8 is **the verdict**. The parser stores
+it at `ctx+0x14264`, and the result scene (`FUN_00a684f0`) turns it into the
+banner and the room's win tally:
+
+| u8 | banner | tally |
+|---|---|---|
+| 0 | WIN | this player +1 |
+| 1 | LOSE | the opponent +1 |
+| anything else | neither (a draw) | none |
+
+A non-zero status stores 3. The server used to send 0 to both players, so
+both saw WIN while the score and judgement counts, which come peer to peer,
+were correct. The server now holds the first report, answers both once the
+second arrives (higher score wins, equal scores draw), and keeps the result in
+`h2h_results` with `game = 'sn'`. A player whose opponent never reports gets
+a win after `--sn-endgame-wait` seconds.
 
 #### Chat
 
@@ -776,6 +846,25 @@ and 0..9 made the card invalid, so at least one is a bounded index; they are
 served as zero. The server reads competitions from `sn_competitions.json`
 beside the state file on every request (see `sn_competitions` in gate.py) and
 files each on the open (`0x5032`) or future (`0x5036`) list by its dates.
+
+#### Ranking board (`0x6000` → `0x6002`)
+
+SuperNOVA's `0x6000` is 8 bytes, `s32` start (-1 and 0 seen) and `s32` count
+(100). It has no board type and no week, so the server serves one all-time
+board from the kept results, sorted by most wins. The 45-byte row is
+`s32 rank / s32 id / char[16] / u8 dancer / s32 x5`, and the screen
+(`FUN_00a601b4`, DATA04) treats the five as follows:
+
+| s32 | clamp | served as |
+|---|---|---|
+| 1 | 999,999,999 | points (3 per win, 1 per draw) |
+| 2, 3, 4 | 9999 each, summed for the player's own MATCH | win, draw, loss |
+| 5 | 999 | 0, unknown |
+
+MATCH is not sent: the client adds up the three counters. Their order is not
+in the code. The server uses Extreme 2's wire order, WIN, DRAW, LOSS, which is
+**unconfirmed for SuperNOVA**. With `--stat-probe` the row reads
+11111 / 222 / 333 / 444 / 555, and one screenshot of the board settles it.
 
 #### The login blob
 
@@ -1316,6 +1405,194 @@ pattern does not generalise; check each one.
 
 ---
 
+## SuperNOVA 2
+
+DDR SuperNOVA 2 (USA), SLUS-21608. Addresses in this section are in
+`SLUS_216.08` unless stated otherwise. **None of it has been run against a
+client yet.** Every shape below is read out of the disc, and the server
+implements it that way, but this section is the static reading, waiting for
+the first live trace.
+
+### It is SuperNOVA, rebuilt
+
+The thirteen overlays are the same modules (`*_rel4` where SuperNOVA has
+`*_mas4`) at new load bases, `0x00976000` and `0x009b6000`. `DATA07`
+`net_dnas` has exactly SuperNOVA's text and data sizes and differs only in its
+relocations. The field codec is the same, function for function and in the
+same order, but recompiled with different instruction scheduling, so no byte
+signature carries over and every reader had to be paired by what it does:
+
+| reader | SuperNOVA | SuperNOVA 2 |
+|---|---|---|
+| more? | `0x00279a60` | `0x0027ad80` |
+| cstr | `0x00279a90` | `0x0027adc0` |
+| str(n) | `0x00279b10` | `0x0027ae40` |
+| s32 | `0x00279b90` | `0x0027aec0` |
+| u32 | `0x00279c70` | `0x0027afa0` |
+| u16 (two copies) | `0x00279d30`, `0x00279d80` | `0x0027b070`, `0x0027b0c0` |
+| u8 (two copies) | `0x00279dd0`, `0x00279e10` | `0x0027b110`, `0x0027b150` |
+| STATUS(u32) | `0x00271530` | `0x002726d0` |
+| request begin | `0x0027a330` | `0x0027b6a0` |
+
+`tools/sndispmap.py` carries both tables and picks one by the size of the
+executable it is given. The new compiler also folds a run of request compares
+into a range test, `addiu rX,rX,-0x4520 ; sltiu $at,rX,2`, which the tool now
+reads as `0x4520` and `0x4521`. Without that, the four `0x452x` friend replies
+looked like pushes.
+
+### Hosts and ports
+
+Service table at `0x00301240`, same shape as SuperNOVA's:
+
+| entry | SuperNOVA 2 |
+|---|---|
+| gate | `game.ddr.konamionline.com` |
+| HTTP | `www.ddr.konamionline.com/ddrsn2/...`, `.php` registration |
+| info | `info.service.konamionline.com/VW350-U1/info/` |
+| ports | `0x73827385`: **29573** (gate), **29570** |
+| STUN | `ddrsnstun.konamionline.com`, 3478 |
+
+The server identifies SuperNOVA 2 by those two ports (`--sn2-ports`) and hands
+it 29570 in the server list.
+
+### What is the same
+
+`sndispmap.py`'s map of SuperNOVA 2 differs from SuperNOVA's in a handful of
+groups. Everything else has the same opcodes and the same body shapes:
+login, player files, the block list, the friends list, news, chat, and the
+song and competition families. On the request side, `0x3910`, `0x4330` and
+`0x4430` changed shape and four requests are new. A SuperNOVA 2 session is
+therefore `is_sn` as well, and `is_sn2` gates only what follows.
+
+### Rooms have four slots
+
+The theme of every change. A SuperNOVA room had one opponent; a SuperNOVA 2
+room is an array of four member slots (stride `0xa0` from room+`0x38`, filled
+by `0x00295fc0`), and **a push about a player names the player by id**: the
+parser walks the four slots with `0x00295720(room, i)` and acts on the one
+whose id matches. A push with id 0 matches nobody and does nothing.
+
+| push | SuperNOVA | SuperNOVA 2 |
+|---|---|---|
+| `0x4412` ready | `u8` | `s32 id, u8` (`0x0026fc50`) |
+| `0x43b5` difficulty | `u8` | `s32 id, u8` (`0x0026dcb0`) |
+| `0x4351` player left | `u32` status | `u32, s32 id, u8` (`0x00270400`): u8 0 removes the slot, non-zero only marks it |
+| `0x4405` | none | `s32 id, s32, u8, u8, u16` (`0x0026b980`) |
+| `0x4411` ready gate | `u32, u16 song, u8, u8` | the same 8 bytes, but the last u8 is now a count (mod 5) of `s32 id, u8` pairs that follow |
+
+### Joining: `0x4333` replaces `0x4b00`
+
+Nothing in `SLUS_216.08` builds `0x4b00` (the `0x4b00` immediates in `DATA09`
+are a buffer size), so a SuperNOVA 2 client never asks where its opponent is.
+The `0x4b01` parser is still there, unreached.
+
+Instead, JOIN is two steps. `0x4323` is answered by `0x4324`, which is now a
+bare status (`0x00270910`), and the client then sends the new bodiless
+`0x4332` (`0x00270e40`) for the room itself:
+
+```
+0x4333   parser 0x00270a80
+    u32 status
+    s32 (dropped) / char[16] / s32 owner id / u16 song / u8 / s32 / u8 (dropped) / s8
+        -> 0x002962c0(room, owner, name, song, ...)
+    u8 count
+    count x member, 81 bytes each:
+        s32 id / char[16] name / u8 dancer / u8 / s8 / s32 / u16 x5 / u8 / s32
+        u16 port / u16 port / char[16] addr / char[16] addr
+        s8 slot / s8 ready / s8
+```
+
+**The owner's player id is the room's identity**, room+4, which is what this
+server already uses as a room id. The member record carries the **address**:
+two ports then two 16-byte strings, filed at slot `+0x34`..`+0x59` exactly
+like an endpoint block. `0x4325`, "a player joined your room" (`0x002706d0`),
+is the same record up to and including the slot byte, 79 bytes.
+
+The server serves the pairs public first, the way SuperNOVA's `0x4b01`
+orders them. **Which pair is public is not confirmed for SuperNOVA 2.** Under
+`--udp-relay` it makes no difference, since both pairs are the relay.
+
+### Searching: `0x4a04` / `0x4a13` are just a room id
+
+Both shrank from the 67-byte match record to `u32 status, s32`
+(`0x0026d820`, `0x0026d770`). Each passes the s32 to `0x00296390` and sets
+room+`0x2c`, to 0 for `0x4a04` and 1 for `0x4a13`, so the two still choose
+guest or owner. The room's contents follow from `0x4332`. The server pushes
+`0x4a04` with the host's room id to a searcher, and `0x4325` to the host.
+
+### Other replies that grew
+
+| reply | SuperNOVA 2 | served as |
+|---|---|---|
+| `0x4310` / `0x4322` room list | SuperNOVA's 36 bytes + `u8` | the extra byte zero |
+| `0x4393` song set | `u32, u16` | status + the song echoed |
+| `0x4395` difficulty set | `u32, s32, u8` | status + own id + the difficulty |
+| `0x4391` | `u32, u8` | status + the request's first byte |
+| `0x4381` | `u32, s32` | status + the request's first four bytes |
+| `0x4431` GetEndgame | 27 bytes | status + zeros |
+| `0x4434`, `0x4450` | `u32, s32` | not sent |
+| `0x4312 -> 0x4313` | new, END with no body | empty |
+| `0x4460 -> 0x4461`, `0x4470 -> 0x4471` | new; `u32, s32 id, u8`, the u8 to that id's slot ready flag (`0x00295e40`) | status, own id, 0 |
+
+`0x4460` and `0x4470` are bodiless and called from two different scenes
+(`0x0029c970`, `0x002a0d64`). Their replies are ENDs on the main RPC block
+that never compare the in-flight request, so only `tools/snblocks.py` groups
+them; the `+1` fallback would have sent them empty. Which one readies is not
+known, so both are answered with ready 0 and logged.
+
+`0x4400` is still in the dispatch, but nothing in the main executable builds
+it.
+
+### Notifications
+
+Four new requests are sent **without** setting the in-flight field: their
+issuers call the transport `0x0026a580` directly and never wait. They must not
+be answered (`SN2_NO_REPLY`): `0x43c1`, which `+1` would send for `0x43c0`,
+has a parser with no in-flight check, and an unsolicited copy would raise its
+event flag.
+
+| request | body | issuer |
+|---|---|---|
+| `0x43c0` | `u32, s8` | `0x0026b900` |
+| `0x43c2` | `s32, u32` | `0x0026b750` |
+| `0x4403` | `u16, s32` | `0x0026bb50` |
+| `0x4404` | `u32, s8, s8, u16` | `0x0026bab0` |
+
+`0x4404` and the `0x4405` push are the same fields with an id in front, so the
+server relays one as the other to the opponent, the sender's id prepended.
+What it carries is not identified. `0x43c0`, `0x43c2` and `0x4403` are logged
+and dropped until a trace shows who should hear about them. The pushes
+`0x43c1`, `0x43c3`, `0x4461` and `0x4471` are new and never sent.
+
+### Songs and tournaments
+
+The song table is 72 records at `0x002f1a20`, stride `0xa8`, each opening with
+the song's code (`andt`, `ange`, ... `pard`), and the wire song id is the index
+into it, as in SuperNOVA. There are **no online-only songs**: the five that
+SuperNOVA locks for online play (`felw`, `punc`, `nizi`, `silv`, `trim`) are
+ordinary songs here, at `0x32`, `0x34`, `0x3c`, `0x40` and `0x41`, and the
+`online/` paths in the executable are interface textures, not charts. So the
+`0x8002` unlock list is served empty; a song absent from it is not locked,
+which SuperNOVA's tournaments already rely on.
+
+The competition messages (`0x5030`..`0x5043`, `0x5000`/`0x5001`, `0x5020`)
+have SuperNOVA's shapes exactly. SuperNOVA 2's competitions come from
+`schedule.sn2_auto_competitions`, generated from the clock like Extreme 2's
+Ranking Challenge:
+
+| competition | id | window | stages | chart |
+|---|---|---|---|---|
+| WEEKLY CUP mm/dd | 10000 + week since the epoch | Thursday 00:00 UTC, one week | 5 | basic, difficult, expert in turn |
+| MARATHON mm/dd | 20000 + 28-day period | 28 days | 10 | difficult |
+
+The next of each is listed as upcoming (`0x5036`). Ids are per period, so each
+period's board starts empty, and they stay clear of SuperNOVA's, which share the
+score table. `sn2_competitions.json` beside the state file replaces the
+generated set (same format as `sn_competitions.json`); `--sn2-comp none` turns
+competitions off.
+
+---
+
 ## DNAS
 
 Both games authenticate against Sony's DNAS before reaching Konami's servers.
@@ -1349,6 +1626,13 @@ This must be a file patch, not a pnach. `0x00a46000` is an overlay slot
 shared by `DATA03` (`net_mas4`) and `DATA04` (`netlby_mas4`); a runtime patch
 there corrupts whichever module is resident. `tools/isopatch.py` patches the
 disc image.
+
+SuperNOVA 2 has the same function at `0x00976fb0` in its own `DATA03`
+(`net_rel4`), calling the same, unchanged DNAS2 library. One thing differs:
+it inlines the `-8` error path where SuperNOVA branched to it, so the compare
+after the call is a `bne` *over* that block, not a `beq` *into* it. The patch
+forces type 5 as before and turns the `bne` into an unconditional branch to
+the success path, which then stores state `0x0b` exactly as SuperNOVA does.
 
 ---
 

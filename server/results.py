@@ -17,7 +17,7 @@ import threading
 from db import (record_rc, record_rc_entry, record_h2h, rc_tries, rc_board,
                 h2h_tally, h2h_board, points_board, player_stats, rc_log,
                 h2h_log, point_log, sn_comp_record, sn_comp_board,
-                credential_verify, credential_set)
+                credential_verify, credential_set, account_claim)
 
 # Re-exported so `results.X` keeps working; silences unused-import checkers.
 __all__ = ['record_rc', 'record_rc_entry', 'record_h2h', 'rc_tries',
@@ -25,7 +25,7 @@ __all__ = ['record_rc', 'record_rc_entry', 'record_h2h', 'rc_tries',
            'player_stats', 'rc_log', 'h2h_log', 'point_log', 'outcome', 'LOCK',
            'parse_rc_entry', 'parse_rc_regist', 'parse_endgame',
            'sn_comp_record', 'sn_comp_board', 'credential_verify',
-           'credential_set']
+           'credential_set', 'account_claim']
 
 LOCK = threading.RLock()
 

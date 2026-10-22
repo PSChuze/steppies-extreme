@@ -52,16 +52,26 @@ CREATE TABLE IF NOT EXISTS friends (
 -- registration flow wrote it. Empty unless --verify-login is on.
 CREATE TABLE IF NOT EXISTS credentials (
     username TEXT PRIMARY KEY, digest TEXT, source TEXT, updated TEXT);
+-- Which full username owns each account. The account key is only the first 8
+-- bytes of the username, so without this a second username sharing those 8
+-- bytes would land in the same account. This records the full username that
+-- first claimed a key; verify-login then refuses a different one. Empty unless
+-- --verify-login is on.
+CREATE TABLE IF NOT EXISTS account_owners (
+    key TEXT PRIMARY KEY, username TEXT, created TEXT);
 CREATE TABLE IF NOT EXISTS rc_results (
     t INTEGER, week INTEGER, card INTEGER, player INTEGER, name TEXT,
     dancer INTEGER, score INTEGER, combo INTEGER, ms INTEGER, stage INTEGER,
     song INTEGER);
 CREATE TABLE IF NOT EXISTS rc_entries (
     t INTEGER, week INTEGER, card INTEGER, player INTEGER);
+-- `game` is 'x2' or 'sn'. The two games keep separate boards; the column was
+-- added after the table, so _migrate adds it to an older database.
 CREATE TABLE IF NOT EXISTS h2h_results (
     t INTEGER, week INTEGER,
     a_player INTEGER, a_name TEXT, a_dancer INTEGER, a_score INTEGER,
-    b_player INTEGER, b_name TEXT, b_dancer INTEGER, b_score INTEGER);
+    b_player INTEGER, b_name TEXT, b_dancer INTEGER, b_score INTEGER,
+    game TEXT NOT NULL DEFAULT 'x2');
 CREATE TABLE IF NOT EXISTS sn_comp_results (
     t INTEGER, comp INTEGER, player INTEGER, name TEXT, stage INTEGER,
     score INTEGER);
@@ -91,8 +101,19 @@ def setup(state_dir):
         _conn.row_factory = sqlite3.Row
         _conn.executescript('PRAGMA journal_mode=WAL;'
                             'PRAGMA synchronous=NORMAL;' + SCHEMA)
+        _migrate()
         _conn.commit()
         _import_json_once()
+
+
+def _migrate():
+    """Bring a database made by an older schema up to this one."""
+    cols = [r['name'] for r in _conn.execute('PRAGMA table_info(h2h_results)')]
+    if 'game' not in cols:
+        # Every row before this column existed is an Extreme 2 match:
+        # SuperNOVA results were not kept.
+        _conn.execute("ALTER TABLE h2h_results "
+                      "ADD COLUMN game TEXT NOT NULL DEFAULT 'x2'")
 
 
 def close():
@@ -275,15 +296,16 @@ def record_rc(pid, name, dancer, week, card, score, combo, ms, stage,
             (now, week, card, pid, name, dancer, score, combo, ms, stage, song))
 
 
-def record_h2h(week, a, b, now=None):
+def record_h2h(week, a, b, now=None, game='x2'):
     now = int(now or time.time())
     with _lock, _conn:
         _conn.execute(
             'INSERT INTO h2h_results (t,week,a_player,a_name,a_dancer,a_score,'
-            'b_player,b_name,b_dancer,b_score) VALUES (?,?,?,?,?,?,?,?,?,?)',
+            'b_player,b_name,b_dancer,b_score,game) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
             (now, week, a.get('player', 0), a.get('name', ''),
              a.get('dancer', 0), a.get('score', 0), b.get('player', 0),
-             b.get('name', ''), b.get('dancer', 0), b.get('score', 0)))
+             b.get('name', ''), b.get('dancer', 0), b.get('score', 0), game))
     return outcome(a.get('score', 0), b.get('score', 0))
 
 
@@ -336,21 +358,22 @@ def rc_board(week, card, now=None):
             for i, r in enumerate(order)]
 
 
-def _h2h_rows(week, now):
+def _h2h_rows(week, now, game='x2'):
     with _lock:
         if week <= 0:
-            return _conn.execute('SELECT * FROM h2h_results').fetchall()
+            return _conn.execute('SELECT * FROM h2h_results WHERE game=?',
+                                 (game,)).fetchall()
         lo, hi = _window(week, now)
         return _conn.execute(
-            'SELECT * FROM h2h_results WHERE week=? AND t>=? AND t<?',
-            (week, lo, hi)).fetchall()
+            'SELECT * FROM h2h_results WHERE game=? AND week=? AND t>=? AND t<?',
+            (game, week, lo, hi)).fetchall()
 
 
-def h2h_tally(week=0, now=None):
+def h2h_tally(week=0, now=None, game='x2'):
     now = int(now or time.time())
     out = {}
     names = {}
-    for r in _h2h_rows(week, now):
+    for r in _h2h_rows(week, now, game):
         pa, pb = r['a_player'], r['b_player']
         names[pa] = (r['a_name'], r['a_dancer'])
         names[pb] = (r['b_name'], r['b_dancer'])
@@ -370,8 +393,8 @@ def _rank(tally, key):
             for i, (pid, t) in enumerate(sorted(tally.items(), key=key))]
 
 
-def h2h_board(week=0, now=None):
-    return _rank(h2h_tally(week, now),
+def h2h_board(week=0, now=None, game='x2'):
+    return _rank(h2h_tally(week, now, game),
                  lambda kv: (-kv[1]['win'], kv[1]['loss'], -kv[1]['draw'], kv[0]))
 
 
@@ -417,7 +440,8 @@ def _weeks_played(pid, now):
     with _lock:
         rows = _conn.execute(
             'SELECT DISTINCT week, MAX(t) mt FROM h2h_results '
-            'WHERE a_player=? OR b_player=? GROUP BY week ORDER BY mt DESC',
+            "WHERE game='x2' AND (a_player=? OR b_player=?) "
+            'GROUP BY week ORDER BY mt DESC',
             (pid, pid)).fetchall()
     seen = []
     for r in rows:
@@ -515,3 +539,23 @@ def credential_set(username, digest, source='register', now=None):
         _conn.execute('INSERT OR REPLACE INTO credentials (username,digest,'
                       'source,updated) VALUES (?,?,?,?)',
                       (username, digest, source, str(now)))
+
+
+def account_claim(key, username, now=None):
+    """Tie an 8-byte account key to the full username that owns it.
+
+    Returns 'first' when the key was unclaimed (and records the owner), 'ok'
+    when `username` already owns it, and 'mismatch' when a different username
+    does. The account key is only the first 8 bytes of the username, so this is
+    what stops a second username sharing those 8 bytes from entering the first
+    one's account.
+    """
+    now = int(now or time.time())
+    with _lock, _conn:
+        row = _conn.execute('SELECT username FROM account_owners WHERE key=?',
+                            (key,)).fetchone()
+        if row is None:
+            _conn.execute('INSERT INTO account_owners (key,username,created) '
+                          'VALUES (?,?,?)', (key, username, str(now)))
+            return 'first'
+        return 'ok' if row['username'] == username else 'mismatch'

@@ -13,6 +13,7 @@
 # They contain no game code, and are applied by the user to their own disc.
 # ---------------------------------------------------------------------------
 Games/
+Game Files/
 work/
 ghidra/
 out/
@@ -48,6 +49,18 @@ admin_token
 xorkey.bin
 selftest_key.bin
 hosts.ini
+
+# The setup program's files in a server folder (setup.py): settings and
+# secrets, backups of the state, discs it unpacked from zips, what it unpacked.
+.env
+setup.json
+backups/
+discs/
+.setup-files
+.setup-version
+# packaging/build_setup.py
+build/
+dist/
 
 # ---------------------------------------------------------------------------
 # Python / editor

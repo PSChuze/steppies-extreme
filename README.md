@@ -1,12 +1,13 @@
 # DDR Online
 
-A replacement for the online servers of two PlayStation 2 games. Konami shut
+A replacement for the online servers of three PlayStation 2 games. Konami shut
 both services down years ago. This brings them back on a machine you control.
 
 | game | serial | state |
 |---|---|---|
 | Dance Dance Revolution Extreme 2 (USA) | SLUS-21174 | Playable. Login, lobby, head-to-head matches, Ranking Challenge, rankings and personal records. |
 | Dance Dance Revolution SuperNOVA (USA) | SLUS-21377 | Playable. Account creation, matchmaking, chat, friends and tournaments work. |
+| Dance Dance Revolution SuperNOVA 2 (USA) | SLUS-21608 | In progress. Login, lobby, rooms and tournaments are in place; matchmaking between two players is written from the disc and not yet tried against a client. |
 
 Everything was recovered from the retail discs and checked against a real
 client. Claims in the documentation carry the address or the wire trace they
@@ -21,6 +22,20 @@ No game data. No disc images, nothing extracted from a disc, no decompiler
 projects, no strings or disassembly dumps. You need your own copy of each game.
 The files under `patches/` describe addresses and instructions, and you apply
 them to your own disc.
+
+## The easy way: DDR Online Setup
+
+Not comfortable with a terminal? Download DDR Online Setup for your computer
+from Releases (Windows, Mac with Apple silicon, or Linux) and run it. It asks
+three questions: who will play, where your disc images are, and what to call
+the server. Then it starts the server, checks it, and tells you how to point
+PCSX2 or a console at it. Run it again for a menu: start and stop, settings,
+updates, backups, patching a disc, and connecting to an OpenLobby admin panel.
+
+On Windows and macOS it runs the server straight on your computer, no Docker
+needed, so players' real addresses reach the server. On Linux it uses
+docker compose with the file below. [docs/setup.md](docs/setup.md) is the
+guide. From a copy of this repository, `python3 setup.py` does the same.
 
 ## Running it
 
@@ -40,11 +55,11 @@ Without Docker:
 
 ```sh
 python3 server/selftest.py     # offline checks, no client needed
-python3 server/gate.py --host 0.0.0.0 --also-listen 19573,19570 \
+python3 server/gate.py --host 0.0.0.0 --also-listen 19573,19570,29573,29570 \
                        --serve-svrinfo --serve-svrlist --serve-block --serve-rc \
                        --udp-relay
 python3 server/stun.py --host 0.0.0.0
-python3 server/web.py  --host 0.0.0.0    # SuperNOVA only
+python3 server/web.py  --host 0.0.0.0    # SuperNOVA and SuperNOVA 2
 ```
 
 ### Pointing the console at it
@@ -54,11 +69,13 @@ resolves. Point these names at the machine running the server:
 
 | name | game | service |
 |---|---|---|
-| `dx2gate01.konamionline.com` | both | gate |
+| `dx2gate01.konamionline.com` | Extreme 2, SuperNOVA | gate |
+| `game.ddr.konamionline.com` | SuperNOVA 2 | gate |
 | `dx2stun.konamionline.com` | Extreme 2 | STUN |
-| `ddrsnstun.konamionline.com` | SuperNOVA | STUN |
+| `ddrsnstun.konamionline.com` | SuperNOVA, SuperNOVA 2 | STUN |
 | `dx2web.konamionline.com` | SuperNOVA | HTTP |
-| `info.service.konamionline.com` | SuperNOVA | HTTP |
+| `www.ddr.konamionline.com` | SuperNOVA 2 | HTTP |
+| `info.service.konamionline.com` | SuperNOVA, SuperNOVA 2 | HTTP |
 
 Any DNS server that can override a name will do. On PCSX2 the built-in DNS
 overrides are enough.
@@ -100,15 +117,23 @@ machine's address.
 | 9573 | gate, account, lobby | Extreme 2 |
 | 19573 | gate | SuperNOVA |
 | 19570 | account, lobby | SuperNOVA |
-| 19580 | HTTP | SuperNOVA |
+| 29573 | gate | SuperNOVA 2 |
+| 29570 | account, lobby | SuperNOVA 2 |
+| 19580 | HTTP | SuperNOVA, SuperNOVA 2 |
 | 3478–3479/udp | STUN | both |
-| 19600–19615/udp | match relay | SuperNOVA |
+| 19600–19615/udp | match relay | SuperNOVA, SuperNOVA 2 |
+| 19581, 19582, 19583 | the boards, one page per game | Extreme 2, SuperNOVA, SuperNOVA 2 |
 
 SuperNOVA reads its ports from a table in its executable, and they are not the
 same as Extreme 2's. It also plays matches peer to peer over UDP, which two
 consoles behind an emulator or a home router cannot do directly, so the gate
 relays that traffic on 19600–19615. Extreme 2 needs none of this: its match
 traffic already travels over the lobby connection.
+
+SuperNOVA 2 has its own pair, 29573 and 29570, and its own gate name. The
+server tells the games apart by the port each connection arrives on, so a
+SuperNOVA 2 player only ever sees, joins and plays other SuperNOVA 2 players.
+Accounts are shared: the same username logs in to either SuperNOVA.
 
 Port 19580 is this project's choice. The stock URLs use 80 and 443, and the
 disc patch rewrites them to something that will not collide.
@@ -130,13 +155,22 @@ python3 tools/isopatch.py "SuperNOVA (USA).iso" "SuperNOVA (USA) [ONLINE].iso"
 
 Either route checks every original byte before writing anything, and rewrites
 sectors in place so the disc layout is untouched. Extreme 2 changes by 4 bytes,
-SuperNOVA by 160.
+SuperNOVA by 160, SuperNOVA 2 by 156.
+
+There is no `.xdelta` for SuperNOVA 2 in Releases yet, so use `isopatch.py`
+for it.
 
 For Extreme 2 under PCSX2 you can skip the disc patch and drop
 `patches/SLUS-21174_E8FB7A7F.pnach` into your `cheats/` folder instead. There is
-no working cheat file for SuperNOVA: its DNAS2 code sits in an overlay slot
-shared with another module, so a per-frame write corrupts whichever one happens
-to be loaded.
+no working pnach for either SuperNOVA: the DNAS2 code sits in an overlay slot
+nine modules take turns in, so a per-frame write corrupts whichever one happens
+to be loaded, and a pnach cannot check first.
+
+On a console with a real disc in the drive there is nothing to patch, so
+all three games get cheat codes instead: `patches/cheats/DDR-Online.txt`,
+generated from the same manifest, for Cheat Device PS2 under FreeMcBoot.
+[docs/cheats.md](docs/cheats.md) is that guide. SuperNOVA's codes test the
+resident module before writing, which is the part a pnach has no way to say.
 
 Extreme 2 also needs a network configuration on the memory card and ships no way
 to create one. SuperNOVA includes Sony's configuration tool, so if you have
@@ -159,6 +193,15 @@ If you want to say something specific, the web service has an operator page at
 difficulty or length of any challenge. Anything you leave alone stays generated,
 so you can fix the difficulty and let the songs keep rotating.
 
+## SuperNOVA 2 tournaments
+
+SuperNOVA 2 runs its tournaments the same way, from the calendar: a five-song
+WEEKLY CUP that changes every Thursday at 00:00 UTC and steps through basic,
+difficult and expert, and a ten-song MARATHON every 28 days. The next one of
+each shows as upcoming. Every period has its own id, so each board starts
+empty. To run your own instead, put a `sn2_competitions.json` beside the
+database, in the same format as SuperNOVA's `sn_competitions.json`.
+
 The page wants a token in the URL. One is generated on first run and printed in
 the log:
 
@@ -166,8 +209,10 @@ the log:
 docker compose logs web | grep operator
 ```
 
-There is no login beyond that token. It is sized for a game server on a home
-network. Do not put port 19580 on the internet.
+There is no login beyond that token, and it travels in the clear. Port 19580
+has to be reachable for SuperNOVA, so by default the page answers only LAN,
+tailnet and loopback addresses. A request from the internet gets the same
+answer as if the page did not exist. `--admin-from any` on `web.py` lifts that.
 
 ## Accounts
 
@@ -197,12 +242,132 @@ password and email, because nothing reads them back yet. `--reg-keep-secrets`
 keeps them, which is for protocol work against your own client, not for a
 server other people use.
 
+## Boards
+
+Each game has a live board: a web page showing who is online and the current
+standings, and optionally a Discord message that keeps itself up to date.
+SuperNOVA and SuperNOVA 2 show each tournament's ranking. Extreme 2 shows this
+week's Ranking Challenge and the head-to-head points. The numbers come from the
+same queries as the in-game ranking screens, so the board and the console
+always agree.
+
+The boards look like the games because they are drawn with the games' own art:
+backgrounds, rank plates and fonts. That art is on your discs, not in this
+project, so bake it once from the folder holding your disc images:
+
+```sh
+docker compose run --rm -v "$PWD:/discs:ro" boards python3 boardart.py /discs/*.iso
+```
+
+That writes PNGs and an index into the state volume, under `boardart/`. Clean
+and patched images both work. Discs it does not recognise are skipped.
+
+The pages are on ports 19581 (Extreme 2), 19582 (SuperNOVA) and 19583
+(SuperNOVA 2). To post a board to Discord, create a webhook for the channel and
+put its URL in a `.env` file beside `docker-compose.yml`:
+
+```sh
+DDR_BOARDS_SN_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+```
+
+The board posts one message and edits it in place, at most once a minute, with
+a picture of the game's ranking screen. A new week, a new leader, or a
+tournament opening or closing goes out as a short post that deletes itself
+after ten minutes. `DDR_BOARDS_SN_URL` adds a link to the page. The variables
+for the other two boards start `DDR_BOARDS_E2_` and `DDR_BOARDS_SN2_`.
+
+A board can also run as a Discord bot instead of a webhook. Create an
+application in the Discord developer portal, invite its bot, and give the board
+its token, application id and public key:
+
+```sh
+DDR_BOARDS_SN_DISCORD_BOT_TOKEN=...
+DDR_BOARDS_SN_DISCORD_APP_ID=...
+DDR_BOARDS_SN_DISCORD_PUBLIC_KEY=...
+DDR_BOARDS_SN_URL=https://your.host/
+```
+
+Set the application's interactions endpoint to the page's URL followed by
+`/discord/interactions`, which must be reachable from the internet. In a
+server, a member who can manage it runs `/ddrsnboard here` in the channel the
+board should post in. `/ddre2board` and `/ddrsn2board` do the same for the
+other two. Each server gets its own board, and the bot's status shows how many
+players are online.
+
+The bot's board message has buttons that switch what it shows: each
+tournament's ranking, the ONLINE PLAY screen with the stages and who is in the
+lobby, or Extreme 2's two cards and head-to-head tables. The picture comes from
+the board's public page, so the page must be reachable from the internet.
+`/ddrsnboard news` in another channel turns on lasting announcements there: a
+tournament opening or ending, or a new Ranking Challenge week.
+
+If the server runs beside a PlayOnline (OpenLobby) stack, the bots can take
+their credentials from its admin page instead. Give the boards container
+`POL_DATABASE_URL`, `POL_BOT_KEY` and `POL_VALKEY_URL`, and add the bots
+(`ddre2`, `ddrsn`, `ddrsn2`) to that stack's `POL_BOT_EXTRA`. A bot restarts
+within a minute of its credentials changing there.
+
+The boards read the database and never write to it. They run in their own
+container, so a problem there cannot affect a game in progress. The gate writes
+who is online to `live.json` in the state volume every five seconds, and
+`--live-file off` turns that off.
+
+## OpenLobby admin panel
+
+The server can be run from an OpenLobby admin panel, beside any other games
+that panel looks after. The gate describes itself to the panel over a small HTTP port (`server/adminport.py`), so the
+panel needs no DDR code of its own. From the panel you get:
+
+- who is online, in which game and what they are doing, and the open
+  tournaments and Ranking Challenge week;
+- the Ranking Challenge weeks and every tournament on the panel's calendar;
+- **Message in the lobby**: a line in the SuperNOVA and SuperNOVA 2 lobby
+  chat, which the panel's maintenance warning uses too. Extreme 2 has no chat,
+  so its players do not see it;
+- **Disconnect a player**, also used by the panel's Kick. It ends the
+  connection and bans nobody;
+- a player search, and each linked account's dancers with their records;
+- three pages: **Rankings**, **News and events** (news, SuperNOVA server
+  information and the Ranking Challenge override, the same things the operator
+  page edits) and **Tournaments**, to add or remove SuperNOVA and SuperNOVA 2
+  tournaments without editing the JSON files by hand.
+
+The setup program connects the two for you. By hand: put a long random
+`DDR_ADMIN_TOKEN` in `.env`, add `COMPOSE_PROFILES=openlobby`, create the
+panel's network if it does not exist yet, and start again:
+
+```sh
+docker network create openlobby
+docker compose up -d
+```
+
+The gate's admin port, 19591, listens only on Docker's bridge address
+(`DDR_ADMIN_BIND`, 172.17.0.1 unless set), and the `admin` service puts it on
+the panel's network as `http://ddr:19591`. Give the panel that address and the
+token (`POL_ADMIN_GAME_DDR_URL`, `POL_ADMIN_GAME_DDR_TOKEN`), or pair it from
+the panel's Settings, Modules page with the setup program. Without a token the
+admin port stays off.
+
+### Linking website accounts
+
+An OpenLobby website can also let players link their DDR login to their
+website account, and set a new DDR password there. That needs the key the
+games encipher logins with, which is on your disc and not in this project:
+
+```sh
+python3 tools/loginkey.py "DDR SuperNOVA (USA).iso" /path/to/state/loginkey.bin
+```
+
+Any of the three discs will do. Then set `GAMELINK_SECRET` (32 characters or
+more, the same value the website has) and the gate answers the website on
+127.0.0.1:19590. Without the secret, or the key, it stays off.
+
 ## Layout
 
 ```
 server/     the server: gate, STUN responder, SuperNOVA web service
 tools/      analysis tools and the disc patcher
-patches/    disc-patch manifest and PCSX2 cheat files
+patches/    disc-patch manifest, PCSX2 pnach files, console cheat codes
 docs/       protocol specification and research notes
 ```
 
@@ -216,11 +381,28 @@ docs/       protocol specification and research notes
 | `server/results.py` | result decoders, and the ranking/log/stat queries |
 | `server/db.py` | SQLite storage for accounts, player files, friends and results |
 | `server/selftest.py` | offline protocol checks, no client required |
+| `server/boards.py` | the boards' web pages and Discord messages |
+| `server/boarde2.py`, `boardsn.py`, `boardsn2.py` | each game's board |
+| `server/boardart.py` | bakes the boards' art from your discs |
+| `server/boardimg.py`, `boardpage.py` | draw a board's screens; the page that shows them |
+| `server/boarddata.py` | what the boards read: database, live.json, calendar |
+| `server/boardbot.py` | a board as a Discord bot: its command, posts and status |
+| `server/discordgw.py` | the Discord Gateway session behind a bot's status |
+| `server/polregistry.py` | bot credentials from a PlayOnline admin page, optional |
+| `server/boardtest.py` | offline checks for the boards, no disc required |
+| `server/adminport.py` | the gate's port for an OpenLobby admin panel |
+| `server/adminrelay.py` | carries that port onto the panel's Docker network |
+| `server/ddrlink.py`, `gamelink.py` | the website account link, optional |
+| `tools/loginkey.py` | copies the login key from your disc, for the account link |
 
 ## Documentation
 
+- [docs/setup.md](docs/setup.md). The setup program, step by step, for people
+  hosting a server.
 - [docs/patching.md](docs/patching.md). Getting past DNAS: which dump you need,
-  applying the patch, real hardware, and why SuperNOVA cannot use a cheat file.
+  applying the patch, real hardware, and why SuperNOVA cannot use a pnach.
+- [docs/cheats.md](docs/cheats.md). The same edits as runtime codes, for
+  booting the original disc on a console.
 - [docs/protocol.md](docs/protocol.md). The wire protocol: framing, opcodes,
   payload layouts, and every place the two games differ.
 - [docs/research-log.md](docs/research-log.md). How it was worked out and, more
@@ -235,9 +417,16 @@ so far is the block-list record, which is 21 bytes in both games with every
 field shifted by one. A length check does not catch that. `Session.is_sn` in
 `gate.py` gates every divergence.
 
+SuperNOVA 2 is SuperNOVA's client rebuilt, so a SuperNOVA 2 session is also
+`is_sn`, and `Session.is_sn2` gates the places it differs: rooms with four
+slots, pushes that name a player id, and a join that fetches the room with
+`0x4332` instead of asking for the opponent's address. The SuperNOVA 2 section
+of [docs/protocol.md](docs/protocol.md) lists them.
+
 If a client hangs on an opcode the server does not know, `tools/sndispmap.py`
 prints the whole receive map: each request, the responses that answer it, and
-the shape of each body. That turns an unknown opcode into a lookup.
+the shape of each body. That turns an unknown opcode into a lookup. Give it
+either game's executable, `SLUS_213.77` or `SLUS_216.08`.
 
 It cannot see every group. Some families keep their state in a block of their
 own and never compare the request in flight, so they do not show up that way.

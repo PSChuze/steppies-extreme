@@ -12,20 +12,30 @@
 # they are standard library only.
 #
 # Point the DNS your console or emulator uses at this host, so that
-# dx2gate01.konamionline.com, dx2stun.konamionline.com and
-# ddrsnstun.konamionline.com resolve here. README.md has the details.
+# dx2gate01.konamionline.com, game.ddr.konamionline.com,
+# dx2stun.konamionline.com and ddrsnstun.konamionline.com resolve here, and
+# the web names too for SuperNOVA and SuperNOVA 2. README.md has the details.
 #
 # Ports used:
 #   9573/tcp    Extreme 2 gate, account and lobby
 #   19573/tcp   SuperNOVA gate
 #   19570/tcp   SuperNOVA account and lobby
+#   29573/tcp   SuperNOVA 2 gate
+#   29570/tcp   SuperNOVA 2 account and lobby
 #   3478/udp    STUN, plus 3479 for change-port requests
-#   19580/tcp   HTTP, SuperNOVA only
-#   19600-19615/udp  SuperNOVA match relay, two ports per match
+#   19580/tcp   HTTP, SuperNOVA and SuperNOVA 2
+#   19581/tcp   the Extreme 2 board page
+#   19582/tcp   the SuperNOVA board page
+#   19583/tcp   the SuperNOVA 2 board page
+#   19600-19615/udp  SuperNOVA / SuperNOVA 2 match relay, two ports per match
 #
 # Override any of these on the command line if something else already has the
 # port, but keep 19580 in step with "web_port" in patches/patches.json: the
 # patched disc asks for that exact port and nothing answers on another one.
+#
+# server/serve.py runs these same commands without Docker (Windows, macOS, via
+# the setup program). Keep the flags in step with commands() there;
+# tests/test_setup_serve.py compares them.
 
 services:
   gate:
@@ -42,8 +52,8 @@ services:
       - --port=9573
       # SuperNOVA dials different ports for the same protocol. The service
       # table at 0x002d013c packs both as u16. These get the full gate, not a
-      # placeholder.
-      - --also-listen=19573,19570
+      # placeholder. SuperNOVA 2 has its own pair, 29573 and 29570.
+      - --also-listen=19573,19570,29573,29570
       - --keyfile=/state/xorkey.bin
       - --state-file=/state/state.json
       - --reply-empty
@@ -55,9 +65,10 @@ services:
       # current on its own. Nothing to configure either way.
       - --serve-svrinfo
       - --serve-svrlist
-      - --svr-name=DDR
-      - --svr-label=DDR
-      - --motd=DDR ONLINE
+      - --svr-name=${DDR_SERVER_NAME:-DDR}
+      - --svr-label=${DDR_SERVER_NAME:-DDR}
+      - --motd=${DDR_MOTD:-DDR ONLINE}
+      - --public-addr=${DDR_PUBLIC_ADDR:-auto}
       - --pair
       - --serve-block
       # Ranking Challenge songs are generated from the week and rotate on
@@ -71,6 +82,17 @@ services:
       # it through the server instead. Extreme 2 does not need it: its
       # match traffic already travels over the lobby connection.
       - --udp-relay
+      # The admin port for an OpenLobby admin panel (server/adminport.py),
+      # bound to Docker's own bridge so only containers can reach it. The
+      # "admin" service below carries it onto the panel's network. It stays
+      # off without DDR_ADMIN_TOKEN.
+      - --admin-port=19591
+      - --admin-bind=${DDR_ADMIN_BIND:-172.17.0.1}
+    environment:
+      - DDR_ADMIN_TOKEN=${DDR_ADMIN_TOKEN:-}
+      # Optional: the website account link (server/ddrlink.py), which also
+      # needs loginkey.bin in the state volume (tools/loginkey.py).
+      - GAMELINK_SECRET=${GAMELINK_SECRET:-}
     volumes:
       - ./server:/app:ro
       - ddr-state:/state
@@ -88,10 +110,11 @@ services:
       - --host=0.0.0.0
       - --port=3478
       - --alt-port=3479
+      - --public-addr=${DDR_PUBLIC_ADDR:-auto}
     volumes:
       - ./server:/app:ro
 
-  # SuperNOVA only. Extreme 2 never makes an HTTP request.
+  # SuperNOVA and SuperNOVA 2 only. Extreme 2 never makes an HTTP request.
   #
   # SuperNOVA fetches a user agreement, a privacy statement and a service
   # information document after the gate and STUN phases, and refuses to
@@ -113,5 +136,98 @@ services:
       - ./server:/app:ro
       - ddr-state:/state
 
+  # The boards: a live standings page per game, and optionally a Discord
+  # message per game that keeps itself up to date. Reads the state volume and
+  # never writes game data. Pages are on 19581 (Extreme 2), 19582
+  # (SuperNOVA) and 19583 (SuperNOVA 2).
+  #
+  # The boards draw with art from your own discs, which this project does not
+  # ship. Bake it once, from the folder holding your disc images:
+  #
+  #   docker compose run --rm -v "$PWD:/discs:ro" boards python3 boardart.py /discs/*.iso
+  #
+  # To post to Discord, put webhook URLs in a .env file beside this one:
+  #
+  #   DDR_BOARDS_E2_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+  #   DDR_BOARDS_SN_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+  #   DDR_BOARDS_SN2_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+  #
+  # and optionally DDR_BOARDS_<GAME>_URL, the public address of each page,
+  # which the Discord message links to.
+  #
+  # Or run each board as a bot (README, "Boards"): DDR_BOARDS_<GAME>_DISCORD_
+  # BOT_TOKEN, _DISCORD_APP_ID and _DISCORD_PUBLIC_KEY, or POL_DATABASE_URL,
+  # POL_BOT_KEY and POL_VALKEY_URL to take them from a PlayOnline admin page.
+  boards:
+    image: python:3.12-slim
+    container_name: ddr-boards
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    command:
+      - python3
+      - -u
+      - boards.py
+      - --state-dir=/state
+      - --e2-port=19581
+      - --sn-port=19582
+      - --sn2-port=19583
+    environment:
+      - DDR_BOARDS_E2_DISCORD_WEBHOOK=${DDR_BOARDS_E2_DISCORD_WEBHOOK:-}
+      - DDR_BOARDS_SN_DISCORD_WEBHOOK=${DDR_BOARDS_SN_DISCORD_WEBHOOK:-}
+      - DDR_BOARDS_SN2_DISCORD_WEBHOOK=${DDR_BOARDS_SN2_DISCORD_WEBHOOK:-}
+      - DDR_BOARDS_E2_URL=${DDR_BOARDS_E2_URL:-}
+      - DDR_BOARDS_SN_URL=${DDR_BOARDS_SN_URL:-}
+      - DDR_BOARDS_SN2_URL=${DDR_BOARDS_SN2_URL:-}
+      - DDR_BOARDS_E2_DISCORD_BOT_TOKEN=${DDR_BOARDS_E2_DISCORD_BOT_TOKEN:-}
+      - DDR_BOARDS_E2_DISCORD_APP_ID=${DDR_BOARDS_E2_DISCORD_APP_ID:-}
+      - DDR_BOARDS_E2_DISCORD_PUBLIC_KEY=${DDR_BOARDS_E2_DISCORD_PUBLIC_KEY:-}
+      - DDR_BOARDS_SN_DISCORD_BOT_TOKEN=${DDR_BOARDS_SN_DISCORD_BOT_TOKEN:-}
+      - DDR_BOARDS_SN_DISCORD_APP_ID=${DDR_BOARDS_SN_DISCORD_APP_ID:-}
+      - DDR_BOARDS_SN_DISCORD_PUBLIC_KEY=${DDR_BOARDS_SN_DISCORD_PUBLIC_KEY:-}
+      - DDR_BOARDS_SN2_DISCORD_BOT_TOKEN=${DDR_BOARDS_SN2_DISCORD_BOT_TOKEN:-}
+      - DDR_BOARDS_SN2_DISCORD_APP_ID=${DDR_BOARDS_SN2_DISCORD_APP_ID:-}
+      - DDR_BOARDS_SN2_DISCORD_PUBLIC_KEY=${DDR_BOARDS_SN2_DISCORD_PUBLIC_KEY:-}
+      - POL_DATABASE_URL=${POL_DATABASE_URL:-}
+      - POL_BOT_KEY=${POL_BOT_KEY:-}
+      - POL_VALKEY_URL=${POL_VALKEY_URL:-}
+    volumes:
+      - ./server:/app:ro
+      - ddr-state:/state
+
+  # Only with an OpenLobby admin panel on this host: puts the gate's admin
+  # port on the panel's "openlobby" network as http://ddr:19591, where the
+  # panel finds it by its labels. Turn it on with COMPOSE_PROFILES=openlobby
+  # in .env, after `docker network create openlobby` if the panel has not
+  # made it yet. The setup program does both when you pair it with a panel.
+  admin:
+    image: python:3.12-slim
+    container_name: ddr-admin
+    restart: unless-stopped
+    profiles: [openlobby]
+    working_dir: /app
+    command:
+      - python3
+      - -u
+      - adminrelay.py
+      - --listen=0.0.0.0:19591
+      - --to=host.docker.internal:19591
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    labels:
+      org.openlobby.role: game
+      org.openlobby.game.key: ddr
+      org.openlobby.game.title: Dance Dance Revolution
+      org.openlobby.admin.url: http://ddr:19591
+    networks:
+      openlobby:
+        aliases: [ddr]
+    volumes:
+      - ./server:/app:ro
+
 volumes:
   ddr-state:
+
+networks:
+  openlobby:
+    external: true

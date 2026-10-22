@@ -138,6 +138,27 @@ class Relay(unittest.TestCase):
                                     "--to", "host.docker.internal:19591"])
         self.assertNotIn("-p", cmd)                 # the admin port is never published
 
+    def test_waits_until_the_relay_listens(self):
+        # The panel probes the game as soon as it is asked to pair, so a relay
+        # that is still starting must be waited for, not reported as running.
+        tries = iter([1, 1, 0])
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return mock.Mock(returncode=next(tries), stdout="")
+        with mock.patch.object(setup, "run", fake_run), mock.patch("time.sleep"):
+            self.assertTrue(setup.relay_ready())
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][:3], ["docker", "exec", setup.RELAY_NAME])
+
+    def test_a_relay_that_never_listens_is_reported(self):
+        out = io.StringIO()
+        with mock.patch.object(setup, "run", lambda cmd, **kw: mock.Mock(returncode=1, stdout="")), \
+                mock.patch("time.sleep"), mock.patch("sys.stdout", out):
+            self.assertFalse(setup.relay_ready(wait=0))
+        self.assertIn("docker logs", out.getvalue())
+
     def test_find_panel_reads_the_label(self):
         fake = mock.Mock(stdout="\nhttp://127.0.0.1:8090/\n")
         with mock.patch.object(setup, "run", return_value=fake) as run:

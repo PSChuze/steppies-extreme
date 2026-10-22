@@ -1148,17 +1148,37 @@ def ensure_relay(quiet=False):
         profiles = [p for p in read_env().get("COMPOSE_PROFILES", "").split(",") if p.strip()]
         if OPENLOBBY_NETWORK not in profiles:
             write_env({"COMPOSE_PROFILES": ",".join(profiles + [OPENLOBBY_NETWORK])})
-        return compose("up", "-d", "admin", check=False, capture=quiet).returncode == 0
+        if compose("up", "-d", "admin", check=False, capture=quiet).returncode != 0:
+            return False
+        return relay_ready()
     have = run(["docker", "inspect", "-f", "{{.State.Running}} {{range .Mounts}}{{.Source}}{{end}}", RELAY_NAME],
                check=False, capture=True)
     state = (have.stdout or "").strip()
     if have.returncode == 0 and state.startswith("true") and os.path.normcase(SERVER_DIR) in os.path.normcase(state):
-        return True
+        return relay_ready()
     run(["docker", "rm", "-f", RELAY_NAME], check=False, capture=True)
     result = run(relay_command(), check=False, capture=True)
-    if result.returncode != 0 and not quiet:
-        say("Could not start the admin relay: %s" % (result.stdout or "").strip())
-    return result.returncode == 0
+    if result.returncode != 0:
+        if not quiet:
+            say("Could not start the admin relay: %s" % (result.stdout or "").strip())
+        return False
+    return relay_ready()
+
+
+def relay_ready(wait=20.0):
+    """Wait until the relay is listening. The panel tries the game's address
+    the moment it is asked to pair, and a relay started a second earlier is
+    still loading Python, so pairing straight away would fail."""
+    probe = ("import socket; socket.create_connection(('127.0.0.1', %d), 2)" % ADMIN_PORT)
+    deadline = time.time() + wait
+    while True:
+        if run(["docker", "exec", RELAY_NAME, "python3", "-c", probe],
+               check=False, capture=True).returncode == 0:
+            return True
+        if time.time() > deadline:
+            say("The admin relay did not start listening. \"docker logs %s\" says why." % RELAY_NAME)
+            return False
+        time.sleep(0.5)
 
 
 def post_json(url, body, timeout=10):

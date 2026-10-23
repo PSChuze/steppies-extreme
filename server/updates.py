@@ -20,7 +20,8 @@ GitHub is asked without a token (60 requests an hour per address), so answers
 are kept an hour, ten minutes after a failure, and fetched on a thread of their
 own: status.json waits for nothing. Every failure is an "unknown" answer with a
 sentence saying why. DDR_UPDATE_REPO names the repository, "off" leaves the
-report out.
+report out, and DDR_UPDATE_HOW replaces the sentence on how to update, for a
+server that is updated some other way (deployed by hand, say).
 
 Updating from the panel ("Update" button) is possible only where the setup
 program's supervisor (serve.py) runs the server, the Windows and macOS installs.
@@ -42,7 +43,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 DEFAULT_REPO = 'PSChuze/steppies-extreme'
 API = 'https://api.github.com'
-HOW = 'Run DDR Online Setup and choose Update.'
+HOW = (os.environ.get('DDR_UPDATE_HOW', '').strip()
+       or 'Run DDR Online Setup and choose Update.')
 TTL = 3600.0
 TTL_FAILED = 600.0
 TIMEOUT = 10.0

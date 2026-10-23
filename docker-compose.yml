@@ -98,6 +98,8 @@ services:
       # with DDR_REVISION=<commit>, and DDR_UPDATE_REPO=off leaves the check out.
       - DDR_REVISION=${DDR_REVISION:-}
       - DDR_UPDATE_REPO=${DDR_UPDATE_REPO:-}
+      - DDR_UPDATE_TRACK=${DDR_UPDATE_TRACK:-}
+      - DDR_UPDATE_HOW=${DDR_UPDATE_HOW:-}
     volumes:
       - ./server:/app:ro
       - ddr-state:/state

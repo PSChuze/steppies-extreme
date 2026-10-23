@@ -48,6 +48,7 @@ HOW = (os.environ.get('DDR_UPDATE_HOW', '').strip()
 TTL = 3600.0
 TTL_FAILED = 600.0
 TIMEOUT = 10.0
+FIRST_WAIT = 3.0
 MAX_CHANGES = 50
 REQUEST_FILE = 'update.request'
 STATE_FILE = 'update.json'
@@ -299,8 +300,9 @@ def status_block(checker, state_dir):
     """The "update" object for status.json, or None to leave it out."""
     if not checker.enabled():
         return None
-    report = checker.get_report() or unknown('The first check is still running.',
-                                             *running())
+    # The first report after a start (an update's restart, say) waits a moment
+    # for GitHub, so the panel does not flash "unknown" before "current".
+    report = checker.get_report(wait=FIRST_WAIT if checker.report is None else 0.0)         or unknown('The first check is still running.', *running())
     if supervised() and track() == 'release':
         report['apply'] = True
     progress = read_state(state_dir)

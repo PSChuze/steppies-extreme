@@ -27,6 +27,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -264,15 +265,27 @@ def ensure_server_files():
 
 def latest_release():
     """(tag, source zip URL) of the newest release, or None."""
+    found = find_release()
+    return found[:2] if found[0] else None
+
+
+def find_release():
+    """(tag, source zip URL, "") of the newest release, or ("", "", why not)."""
     url = "https://api.github.com/repos/%s/releases/latest" % REPO
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"}),
                                     timeout=10) as r:
             info = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "", "", "No release has been published on %s yet." % RELEASES
+        return "", "", "GitHub answered HTTP %d. Try again later." % e.code
     except (OSError, ValueError):
-        return None
+        return "", "", "Could not reach %s. Check the internet connection." % RELEASES
     tag = info.get("tag_name")
-    return (tag, "https://github.com/%s/archive/refs/tags/%s.zip" % (REPO, tag)) if tag else None
+    if not isinstance(tag, str) or not re.match(r"^[A-Za-z0-9._-]+$", tag):
+        return "", "", "The newest release on %s has no usable name." % RELEASES
+    return tag, "https://github.com/%s/archive/refs/tags/%s.zip" % (REPO, tag), ""
 
 
 def server_imports(folder=None):
@@ -1199,10 +1212,23 @@ def post_json(url, body, timeout=10):
     return status, answer if isinstance(answer, dict) else {}
 
 
+def updater_block():
+    """How the panel's deployer updates this server, sent when pairing
+    (pol-server docs/installs.md). Only a Docker install: the deployer runs
+    the command in a Linux container, which can restart containers but not a
+    server running natively on Windows or macOS. Those update themselves when
+    the panel asks (server/updates.py)."""
+    if mode() != "docker":
+        return {}
+    return {"updater": {"folder": ROOT, "command": ["python3", "setup.py", "--update", "--yes"],
+                        "timeout_minutes": 30}}
+
+
 def pair(panel, code, token):
     """Pair with the panel. (pairing id, "") when it worked, else ("", why)."""
-    status, answer = post_json(panel + "/api/pair", {"code": code, "key": GAME_KEY, "title": GAME_TITLE,
-                                                     "url": ADMIN_URL, "token": token})
+    body = {"code": code, "key": GAME_KEY, "title": GAME_TITLE, "url": ADMIN_URL, "token": token}
+    body.update(updater_block())
+    status, answer = post_json(panel + "/api/pair", body)
     if status == 200 and answer.get("ok") and answer.get("pairing"):
         return str(answer["pairing"]), ""
     if status == 0:
@@ -1212,8 +1238,9 @@ def pair(panel, code, token):
 
 def pair_update(panel, pairing, token):
     """Tell the panel the new token. "" when it worked, else why not."""
-    status, answer = post_json(panel + "/api/pair/update", {"key": GAME_KEY, "pairing": pairing,
-                                                            "token": token, "url": ADMIN_URL})
+    body = {"key": GAME_KEY, "pairing": pairing, "token": token, "url": ADMIN_URL}
+    body.update(updater_block())
+    status, answer = post_json(panel + "/api/pair/update", body)
     if 200 <= status < 300:
         return ""
     if status == 0:
@@ -1522,40 +1549,137 @@ def stop_menu():
         say("Stopped. It starts again when you choose Start the server.")
 
 
-def update():
-    """Fetch the new version and restart the server with it."""
+def update_files(progress=None):
+    """Put the newest version's files in place, leaving .env, the state and
+    the rest of KEEP alone. Does not restart anything. Returns (outcome,
+    sentence): outcome is "updated", "current" or "failed". Safe to run again
+    after a failure: it starts over from the download."""
+    progress = progress or say
     if os.path.exists(os.path.join(ROOT, ".git")):
-        if run(["git", "pull", "--ff-only"], check=False).returncode != 0:
-            say("git pull failed (local changes?). Nothing was changed.")
-            return
-    else:
-        release = latest_release()
-        if not release:
-            say("Could not reach %s. Check the internet connection." % RELEASES)
-            return
-        tag, url = release
-        if tag == installed_version():
-            say("This is the newest version (%s)." % tag)
-            return
-        say("Downloading %s..." % tag)
-        archive = os.path.join(ROOT, "logs", "update.zip")
-        os.makedirs(os.path.dirname(archive), exist_ok=True)
-        try:
-            urllib.request.urlretrieve(url, archive)
-            unpack_server(archive, ROOT, tag)
-        except (OSError, zipfile.BadZipFile) as e:
-            say("The download failed (%s). Nothing was changed." % e)
-            return
-        finally:
-            if os.path.exists(archive):
-                os.remove(archive)
-        say("Updated the server's files to %s." % tag)
+        progress("Fetching the newest version with git...")
+        result = run(["git", "pull", "--ff-only"], check=False, capture=True)
+        text = (result.stdout or "").strip()
+        if result.returncode != 0:
+            return "failed", "git pull failed (local changes?): %s" % (text.splitlines() or ["no output"])[-1]
+        if "Already up to date" in text:
+            return "current", "This is the newest version."
+        return "updated", "Updated the server's files from git."
+    progress("Looking for the newest release on %s..." % RELEASES)
+    tag, url, why = find_release()
+    if not tag:
+        return "failed", why
+    if tag == installed_version():
+        return "current", "This is the newest version (%s)." % tag
+    progress("Downloading %s..." % tag)
+    archive = os.path.join(ROOT, "logs", "update.zip")
+    os.makedirs(os.path.dirname(archive), exist_ok=True)
+    try:
+        urllib.request.urlretrieve(url, archive)
+        progress("Checking %s..." % tag)
         if FROZEN:
-            say("A new %s is also on %s" % (APP, RELEASES))
+            missing = modules_missing_for(archive)
+            if missing:
+                return "failed", ("%s needs a newer %s (it uses %s). Download it from %s"
+                                  % (tag, APP, ", ".join(missing), RELEASES))
+        progress("Putting the new files in place...")
+        unpack_server(archive, ROOT, tag)
+    except (OSError, zipfile.BadZipFile) as e:
+        return "failed", "The download failed (%s). Nothing was changed." % e
+    finally:
+        if os.path.exists(archive):
+            os.remove(archive)
+    return "updated", "Updated the server's files to %s." % tag
+
+
+def modules_missing_for(archive):
+    """Modules a downloaded version's server code needs that this program
+    does not carry. The server would not start with them missing, so such an
+    update is refused instead of half done."""
+    work = os.path.join(ROOT, "logs", "update-check")
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        with zipfile.ZipFile(archive) as z:
+            for name in z.namelist():
+                parts = name.split("/")
+                if len(parts) >= 3 and parts[1] in ("server", "tools") and name.endswith(".py"):
+                    target = os.path.join(work, parts[1], parts[-1])
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with z.open(name) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        missing = []
+        for name in server_imports(work):
+            try:
+                if importlib.util.find_spec(name) is None:
+                    missing.append(name)
+            except (ImportError, ValueError):
+                missing.append(name)
+        return missing
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def update():
+    """The menu's Update: fetch the new version and restart the server with it."""
+    outcome, sentence = update_files()
+    say(sentence)
+    if outcome != "updated":
+        return
+    if FROZEN:
+        say("A new %s may also be on %s" % (APP, RELEASES))
     if server_running() or mode() == "docker":
         say("Restarting the server...")
         restart_server()
 
+
+def update_unattended(files_only=False):
+    """--update --yes: what the admin panel's Update runs, with no one at the
+    keyboard. One plain line per step, the last line says how it ended, and
+    the exit status is 0 only when it worked. --files-only leaves restarting
+    to the caller (server/serve.py restarts itself)."""
+    outcome, sentence = update_files()
+    if outcome != "updated" or files_only:
+        say(sentence)
+        return 1 if outcome == "failed" else 0
+    say(sentence)
+    say("Restarting the server...")
+    if mode() == "native":
+        ok = restart_server()
+    else:
+        if uses_openlobby_profile(read_env()):
+            ensure_network(quiet=True)
+        compose("up", "-d", "--force-recreate", "--remove-orphans", check=False)
+        # This may run inside OpenLobby's deployer, which cannot reach the
+        # server's ports, so ask Docker whether it runs instead.
+        ok = False
+        for _ in range(30):
+            if server_running():
+                ok = True
+                break
+            time.sleep(2)
+    say("Updated and running again." if ok else "Updated, but the server did not start again. Look at its logs.")
+    return 0 if ok else 1
+
+
+def check_update():
+    """--check-update: say whether a newer version is out."""
+    newer = newer_release()
+    say("A newer version of the server is out: %s. Run %s and choose Update." % (newer, APP)
+        if newer else "No newer version found.")
+
+
+def newer_release(wait=None):
+    """The newest release's tag when it is not the one installed, else "".
+    With `wait`, gives up after that many seconds (the menu does not wait
+    long for GitHub)."""
+    if os.path.exists(os.path.join(ROOT, ".git")):
+        return ""
+    found = []
+    t = threading.Thread(target=lambda: found.append(latest_release()), daemon=True)
+    t.start()
+    t.join(wait)
+    release = found[0] if found else None
+    current = installed_version()
+    return release[0] if release and current and release[0] != current else ""
 
 def backup_name():
     return os.path.join(BACKUPS, "ddr-%s.zip" % datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -1748,6 +1872,12 @@ def parse_args(argv=None):
     ap.add_argument("--start", action="store_true",
                     help="start the server without the menu (what 'Start with Windows' runs)")
     ap.add_argument("--stop", action="store_true", help="stop the server without the menu")
+    ap.add_argument("--update", action="store_true",
+                    help="update the server to the newest version and restart it, without the menu")
+    ap.add_argument("--yes", action="store_true",
+                    help="with --update: ask nothing (what the admin panel's Update runs)")
+    ap.add_argument("--files-only", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--check-update", action="store_true", help="say whether a newer version is out")
     return ap.parse_args(argv)
 
 
@@ -1764,8 +1894,18 @@ def main(argv=None):
         if not ensure_server_files():
             return
         os.chdir(ROOT)
+        if args.check_update:
+            check_update()
+            return
+        if args.update and args.files_only:
+            sys.exit(update_unattended(files_only=True))
         if mode() == "docker":
-            wait_for_docker(wait=not (args.start or args.stop))
+            wait_for_docker(wait=not (args.start or args.stop or args.update))
+        if args.update:
+            if args.yes:
+                sys.exit(update_unattended())
+            update()
+            return
         if args.start or args.stop:
             if not os.path.exists(ENV):
                 say("Run %s once without --start first: it asks three questions." % APP)
@@ -1778,6 +1918,9 @@ def main(argv=None):
         if not os.path.exists(ENV):
             first_run()
             return
+        newer = newer_release(wait=3)
+        if newer:
+            say("A newer version of the server is out (%s). Choose Update to get it." % newer)
         menu()
     except KeyboardInterrupt:
         say()
@@ -1803,7 +1946,8 @@ if __name__ == "__main__":
     if script is not None:
         run_script(script)
     else:
-        quiet = any(a in ("--start", "--stop", "--help", "-h") for a in sys.argv[1:])
+        quiet = any(a in ("--start", "--stop", "--update", "--check-update", "--help", "-h")
+                    for a in sys.argv[1:])
         try:
             main()
         finally:

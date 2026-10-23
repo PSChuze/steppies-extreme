@@ -329,6 +329,10 @@ of its own. From the panel you get:
 - **Disconnect a player**, also used by the panel's Kick. It ends the
   connection and bans nobody;
 - a player search, and each linked account's dancers with their records;
+- whether a newer version is out and what changed. A server run by the setup
+  program on Windows or macOS has an **Update** button there; a Docker one is
+  updated by the panel's deployer, once its owner allows it (see
+  [docs/setup.md](docs/setup.md));
 - three pages: **Rankings**, **News and events** (news, SuperNOVA server
   information and the Ranking Challenge override, the same things the operator
   page edits) and **Tournaments**, to add or remove SuperNOVA and SuperNOVA 2
@@ -394,6 +398,7 @@ docs/       protocol specification and research notes
 | `server/boardtest.py` | offline checks for the boards, no disc required |
 | `server/adminport.py` | the gate's port for an OpenLobby admin panel |
 | `server/adminrelay.py` | carries that port onto the panel's Docker network |
+| `server/updates.py` | which version runs, whether a newer one is out, updating from the panel |
 | `server/ddrlink.py`, `gamelink.py` | the website account link, optional |
 | `tools/loginkey.py` | copies the login key from your disc, for the account link |
 

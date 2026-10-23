@@ -28,6 +28,12 @@ as an environment variable, as compose's environment: entries do.
 Inside the frozen setup program sys.executable is the program, not a Python,
 so the services are started as `<program> --run-script <script> <args>`, which
 the program hands to runpy. Standard library only.
+
+It also updates the server when the OpenLobby admin panel asks (updates.py):
+the gate leaves update.request in the state folder, and this runs the setup
+program's update, which only replaces the files, then starts everything again
+from the new files, itself included. Progress goes to update.json, which the
+gate reports to the panel.
 """
 import argparse
 import datetime
@@ -40,6 +46,9 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import updates  # noqa: E402
 SERVICES = ("gate", "stun", "web", "boards")
 # The gate's admin port, for the OpenLobby panel. Only loopback here: the panel
 # reaches it through a relay container (setup.py starts it, server/adminrelay.py),
@@ -49,6 +58,9 @@ ADMIN_BIND = "127.0.0.1"
 PID_FILE = "serve.pid"
 STOP_FILE = "serve.stop"
 FROZEN = getattr(sys, "frozen", False)
+# An update that prints nothing for this long has hung.
+UPDATE_TIMEOUT = 30 * 60
+RESTARTING = "Restarting with the new version"
 # Flags only this runner passes, because compose gives the same thing another
 # way (the /state mount), and flags whose value differs on purpose.
 NATIVE_ONLY = {"web": {"--state-dir", "--reg-file"}}
@@ -205,6 +217,7 @@ class Runner:
         self.clock = clock
         self.lock = threading.Lock()
         self.stopping = False
+        self.relaunch = False
         cmds = commands(state, env)
         self.services = [Service(n, cmds[n]) for n in SERVICES if not only or n in only]
 
@@ -223,6 +236,8 @@ class Runner:
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["DDR_STATE_DIR"] = self.state
+        # Tells the gate this runner can update the server (updates.py).
+        env["DDR_SUPERVISED"] = "1"
         # A frozen program started by another copy of itself would otherwise
         # share that copy's unpacked files, which vanish when it exits.
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
@@ -268,6 +283,63 @@ class Runner:
                     svc.next_start = now + 60
                     self.log("serve", "could not start %s (%s); trying again in a minute" % (svc.name, e))
 
+    def setup_command(self):
+        """The setup program's update, files only: this runner restarts
+        everything itself afterwards."""
+        args = ["--folder", ROOT, "--update", "--yes", "--files-only"]
+        if FROZEN:
+            return [sys.executable] + args
+        return [sys.executable, "-u", os.path.join(ROOT, "setup.py")] + args
+
+    def update(self):
+        """Run the update the panel asked for. True when the new files are in
+        place and everything should start again from them."""
+        try:
+            os.remove(os.path.join(self.state, updates.REQUEST_FILE))
+        except OSError:
+            pass
+        self.log("serve", "the admin panel asked for an update")
+        updates.write_state(self.state, state="updating", message="Looking for the newest release")
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1", PYTHONIOENCODING="utf-8")
+        try:
+            proc = subprocess.Popen(self.setup_command(), cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    creationflags=0x08000000 if os.name == "nt" else 0)
+        except OSError as e:
+            updates.write_state(self.state, state="failed", why="The update could not start (%s)." % e)
+            return False
+        lines = []
+        reader = threading.Thread(target=lambda: lines.extend(proc.stdout), daemon=True)
+        reader.start()
+        deadline = time.monotonic() + UPDATE_TIMEOUT
+        seen, last = 0, ""
+        while proc.poll() is None or seen < len(lines) or reader.is_alive():
+            for raw in lines[seen:]:
+                text = raw.decode("utf-8", "replace").strip()
+                if text:
+                    last = text
+                    self.log("update", text)
+                    updates.write_state(self.state, state="updating", message=text[:200])
+                deadline = time.monotonic() + UPDATE_TIMEOUT
+            seen = len(lines)
+            if time.monotonic() > deadline:
+                kill_tree(proc.pid)
+                updates.write_state(self.state, state="failed",
+                                    why="The update stopped answering and was ended.")
+                return False
+            if proc.poll() is not None and not reader.is_alive() and seen == len(lines):
+                break
+            time.sleep(0.2)
+        if proc.returncode != 0:
+            updates.write_state(self.state, state="failed", why=last or "The update failed.")
+            self.log("serve", "update failed; still running the old version")
+            return False
+        if "newest version" in last.lower():
+            updates.write_state(self.state)
+            return False
+        updates.write_state(self.state, state="updating", message=RESTARTING)
+        return True
+
     def stop_requested(self):
         return os.path.exists(os.path.join(self.state, STOP_FILE))
 
@@ -301,10 +373,21 @@ class Runner:
         with open(pid_path, "w", encoding="ascii") as f:
             f.write("%d\n" % os.getpid())
         self.log("serve", "state folder %s" % self.state)
+        progress = updates.read_state(self.state)
+        if progress.get("state") == "updating":
+            if progress.get("message") == RESTARTING:
+                updates.write_state(self.state)          # this start is that restart
+            else:
+                updates.write_state(self.state, state="failed",
+                                    why="The update was cut short when DDR Online stopped. Try it again.")
+        request_path = os.path.join(self.state, updates.REQUEST_FILE)
         try:
             while not self.stopping:
                 if self.stop_requested():
                     self.log("serve", "asked to stop")
+                    break
+                if os.path.exists(request_path) and self.update():
+                    self.relaunch = True
                     break
                 self.check()
                 time.sleep(tick)
@@ -326,9 +409,15 @@ def main(argv=None):
     ap.add_argument("--env-file", default=os.path.join(os.path.dirname(HERE), ".env"),
                     help="settings, as compose reads them (default: .env beside server/)")
     ap.add_argument("--only", default="", help="comma-separated services to run (default: all)")
+    ap.add_argument("--after", type=int, default=0, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     state = os.path.abspath(args.state)
     os.makedirs(state, exist_ok=True)
+    # Started by an older runner after an update: let it finish exiting first.
+    for _ in range(120):
+        if not args.after or not pid_alive(args.after):
+            break
+        time.sleep(0.5)
     other = running_pid(state)
     if other:
         sys.exit("already running (process %d) for %s" % (other, state))
@@ -345,6 +434,27 @@ def main(argv=None):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), on_signal)
     runner.run()
+    if runner.relaunch:
+        relaunch(state, args)
+
+
+def relaunch(state, args):
+    """Start a new runner from the files the update put in place, writing to
+    the same log, and leave it the state folder."""
+    cmd = launcher() + [os.path.abspath(__file__), "--state", state, "--env-file",
+                        os.path.abspath(args.env_file), "--after", str(os.getpid())]
+    if args.only:
+        cmd += ["--only", args.only]
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1", PYTHONIOENCODING="utf-8")
+    try:
+        out = sys.stdout.fileno()
+    except (AttributeError, OSError, ValueError):
+        out = subprocess.DEVNULL
+    kw = {"start_new_session": True}
+    if os.name == "nt":
+        kw = {"creationflags": 0x08000000 | 0x00000200}  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(cmd, cwd=HERE, env=env, stdin=subprocess.DEVNULL, stdout=out,
+                     stderr=subprocess.STDOUT, close_fds=True, **kw)
 
 
 if __name__ == "__main__":

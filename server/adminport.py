@@ -14,6 +14,7 @@ connections.
     GET  /openlobby/players.json    player search, for the panel's pickers
     GET  /openlobby/player.json     one OpenLobby account's dancers here
     POST /openlobby/actions/<id>    announce, disconnect
+    POST /openlobby/update          update to the newest release (updates.py)
     *    /rankings, /content, /tournaments    tool pages, shown inside the panel
 
 Off unless --admin-port is given. Every request must carry the token
@@ -45,6 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import content
 import db
 import schedule
+import updates
 
 KEY = 'ddr'
 TITLE = 'Dance Dance Revolution'
@@ -77,9 +79,13 @@ class Hooks:
     __main__, so importing it here would load a second, empty copy; main()
     hands itself over instead."""
 
-    def __init__(self, gate, args):
+    def __init__(self, gate, args, checker=None):
         self.g = gate
         self.args = args
+        self.updates = checker or updates.Checker()
+
+    def state_dir(self):
+        return os.path.dirname(self.g.STATE_PATH or '') or '.'
 
     def sessions(self):
         """[(game, session)] for every connection that has picked a dancer."""
@@ -136,11 +142,15 @@ def status(h):
                               'detail': '%s, %s left' % (GAME_TITLE[game],
                                                          _span(c['end'] - now)),
                               'state': 'open'})
-    return {'up': True, 'online': len(players), 'players': players,
-            'rooms': rooms, 'rooms_label': 'events',
-            'summary': ', '.join('%s %d' % (GAME_TITLE[g], counts[g])
-                                 for g, _ in GAMES),
-            'facts': [{'label': 'dancers', 'value': len(h.player_files())}]}
+    out = {'up': True, 'online': len(players), 'players': players,
+           'rooms': rooms, 'rooms_label': 'events',
+           'summary': ', '.join('%s %d' % (GAME_TITLE[g], counts[g])
+                                for g, _ in GAMES),
+           'facts': [{'label': 'dancers', 'value': len(h.player_files())}]}
+    update = updates.status_block(h.updates, h.state_dir())
+    if update is not None:
+        out['update'] = update
+    return out
 
 
 def events(h, lo, hi):
@@ -739,6 +749,11 @@ def serve(hooks, bind, port, token, log=print):
                 return self.send(200, manifest())
             if path == PREFIX + 'status.json':
                 return self.send(200, status(hooks))
+            if path == PREFIX + 'update' and method == 'POST':
+                code, answer = updates.request(hooks.state_dir(), actor)
+                if code == 202:
+                    say('admin: %s asked for an update' % (actor or '?'))
+                return self.send(code, answer)
             if path == PREFIX + 'calendar.json':
                 try:
                     lo, hi = int(q.get('from', '0')), int(q.get('to', '0'))

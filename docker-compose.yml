@@ -93,6 +93,11 @@ services:
       # Optional: the website account link (server/ddrlink.py), which also
       # needs loginkey.bin in the state volume (tools/loginkey.py).
       - GAMELINK_SECRET=${GAMELINK_SECRET:-}
+      # Whether a newer version is out, for the admin panel (server/updates.py).
+      # A release knows its own version; a copy deployed by hand can say it
+      # with DDR_REVISION=<commit>, and DDR_UPDATE_REPO=off leaves the check out.
+      - DDR_REVISION=${DDR_REVISION:-}
+      - DDR_UPDATE_REPO=${DDR_UPDATE_REPO:-}
     volumes:
       - ./server:/app:ro
       - ddr-state:/state

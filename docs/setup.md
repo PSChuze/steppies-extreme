@@ -145,7 +145,8 @@ Run the setup program again for the menu:
   OpenLobby panel.
 - **Update**: fetches the newest release and restarts the server. Your
   settings, accounts and backups stay. If a newer setup program is needed, it
-  says so.
+  says so, and changes nothing. When a newer release is out, the menu says so
+  as it opens.
 - **Make a backup**, **Restore a backup**: accounts, player files, results and
   the operator page's settings, as a zip in the `backups` folder. A backup
   can be made while the server runs. Keep a copy of the `.env` file as well:
@@ -179,6 +180,25 @@ on Windows and Mac). Without Docker everything else works as before.
 
 Setup starts a small helper container, `ddr-admin`, that lets the panel reach
 the server. The server's admin port is never opened to your network.
+
+### Updating from the panel
+
+The panel lists DDR Online among its updates: which version runs, whether a
+newer one is out, and what changed.
+
+- **Windows and Mac**: the panel shows an **Update** button. The server
+  fetches the newest release, puts it in place and starts again by itself,
+  and the panel shows each step. Everyone playing is disconnected for a few
+  seconds. If it fails, the old version keeps running and the panel says why.
+- **Linux**: the server runs in Docker, so the panel's deployer does the
+  update with `python3 setup.py --update --yes` in the server folder. Setup
+  asks for that when it pairs; the panel's owner allows it once, under
+  Settings, Modules. Without a deployer the panel says to run the setup
+  program and choose Update.
+
+You can run the same thing yourself: `--update --yes` updates and restarts
+without asking anything, and `--check-update` only says whether a newer
+version is out.
 
 ## When something goes wrong
 

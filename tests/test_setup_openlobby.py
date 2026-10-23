@@ -39,6 +39,10 @@ class Pairing(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.url = "http://127.0.0.1:%d" % self.server.server_port
+        # A native install sends no updater; the Docker case is tested below.
+        patcher = mock.patch.object(setup, "mode", return_value="native")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_pair(self):
         self.server.answers.append((200, {"ok": True, "title": "Dance Dance Revolution", "pairing": "p-123"}))
@@ -47,6 +51,19 @@ class Pairing(unittest.TestCase):
         self.assertEqual(path, "/api/pair")
         self.assertEqual(body, {"code": "AB12CD34", "key": "ddr", "title": "Dance Dance Revolution",
                                 "url": "http://ddr:19591", "token": "tok"})
+
+    def test_docker_install_sends_its_updater(self):
+        # OpenLobby's deployer updates a Docker install with this command,
+        # run in the install folder, once the panel's owner approves it.
+        self.server.answers.append((200, {"ok": True, "pairing": "p-1"}))
+        self.server.answers.append((200, {"ok": True}))
+        with mock.patch.object(setup, "mode", return_value="docker"):
+            setup.pair(self.url, "AB12CD34", "tok")
+            setup.pair_update(self.url, "p-1", "tok")
+        for _path, body in self.server.seen:
+            self.assertEqual(body["updater"], {"folder": setup.ROOT,
+                                               "command": ["python3", "setup.py", "--update", "--yes"],
+                                               "timeout_minutes": 30})
 
     def test_refusals_are_shown_as_given(self):
         for status, message in ((400, "That code is not valid."), (403, "That code has expired."),

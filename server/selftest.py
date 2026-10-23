@@ -1338,8 +1338,9 @@ def test_admin_port():
         sn_comp='open', sn_comp_name='SN', sn_comp_songs=[0],
         sn_comp_back=86400, sn_comp_ahead=86400, sn_comp_future=0,
         sn_comp_file='', sn2_comp='auto')
-    srv = adminport.serve(adminport.Hooks(gate, args), '127.0.0.1', 0, 'tok',
-                          log=lambda m: None)
+    import updates
+    srv = adminport.serve(adminport.Hooks(gate, args, updates.Checker('off')),
+                          '127.0.0.1', 0, 'tok', log=lambda m: None)
     base = 'http://127.0.0.1:%d' % srv.server_address[1]
 
     def call(path, body=None, token='tok', form=False):
@@ -1423,6 +1424,10 @@ def test_admin_port():
         call('/content', {'do': 'rc', 'songs0': '8, 9, 10'}, form=True)
         check('admin: the RC override drops the song that hangs the game',
               content.load()['rc']['songs'] == {'0': [9, 10]})
+        os.environ.pop('DDR_SUPERVISED', None)
+        code, raw = call('/openlobby/update', {})
+        check('admin: a server not run by the setup cannot update itself',
+              code == 503 and b'Setup' in raw)
         code, page = call('/rankings')
         check('admin: rankings page renders',
               code == 200 and b'Ranking Challenge' in page)

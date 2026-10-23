@@ -22,6 +22,7 @@ env:
   SETUP_TESTS: >-
     tests.test_setup_flow tests.test_setup_discs tests.test_setup_upnp
     tests.test_setup_serve tests.test_setup_state tests.test_setup_openlobby
+    tests.test_setup_update
 
 jobs:
   windows:

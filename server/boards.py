@@ -280,9 +280,12 @@ class Discord:
     are logged and survived. The URL and token are secrets and never printed."""
 
     def __init__(self, name, url, state, every=60.0, ttl=600.0, refresh=1800.0,
-                 opener=None, auth=None):
+                 opener=None, auth=None, fluxer=False):
         self.name = name
         self.auth = (auth or '').strip() or None
+        # on Fluxer (boardbot.start_fluxer): `url` is a Fluxer channel, and each
+        # message goes through boardbot.fluxer_payload first (no components there)
+        self.fluxer = bool(fluxer)
         self.url = (url or '').strip().rstrip('/')
         self.path = state
         self.every = max(10.0, float(every))
@@ -297,7 +300,7 @@ class Discord:
         self.hold_until = 0.0
 
     def _log(self, text):
-        log('%s discord: %s' % (self.name, text))
+        log('%s %s: %s' % (self.name, 'fluxer' if self.fluxer else 'discord', text))
 
     def _hook(self):
         return hashlib.sha1(self.url.encode()).hexdigest()
@@ -398,7 +401,11 @@ class Discord:
                 return None
             if sig == self.last_sig and now - self.last_edit < self.refresh:
                 return None
-        body, ctype = multipart(*build())
+        payload, files = build()
+        if self.fluxer:
+            import boardbot
+            payload = boardbot.fluxer_payload(payload)
+        body, ctype = multipart(payload, files)
         did = None
         if self.msg_id:
             st, data = self._call('PATCH', '%s/messages/%s' % (self.url, self.msg_id),
@@ -532,6 +539,17 @@ def build_parser():
                         default=os.environ.get(env + 'DISCORD_PUBLIC_KEY', ''),
                         help='the bot\'s public key: checks what Discord sends to '
                              '/discord/interactions')
+        ap.add_argument('--%s-fluxer-bot-token' % name, metavar='TOKEN',
+                        default=os.environ.get(env + 'FLUXER_BOT_TOKEN', ''),
+                        help='the board\'s Fluxer bot, beside its Discord one (env '
+                             '%sFLUXER_BOT_TOKEN; a secret)' % env)
+        ap.add_argument('--%s-fluxer-channels' % name, metavar='ID,ID',
+                        default=os.environ.get(env + 'FLUXER_CHANNELS', ''),
+                        help='the Fluxer channels the board posts in (Fluxer has no '
+                             'slash commands to choose them)')
+        ap.add_argument('--%s-fluxer-news-channels' % name, metavar='ID,ID',
+                        default=os.environ.get(env + 'FLUXER_NEWS_CHANNELS', ''),
+                        help='the Fluxer channels its announcements go in')
         ap.add_argument('--%s-bot-name' % name, metavar='NAME',
                         default=os.environ.get(env + 'BOT_NAME', 'ddr' + name),
                         help='the bot\'s name: its /<name>board command, its row in '
@@ -556,6 +574,9 @@ def main(argv=None):
         if not board.art_files(args):
             log('%s: no baked art in %s -- run boardart.py against your '
                 'disc; the page will be bare until then' % (name, board.art_dir(args)))
+        # Fluxer runs beside Discord, never instead of it
+        if (getattr(args, '%s_fluxer_bot_token' % name, '') or '').strip():
+            boardbot.start_fluxer(board, args, name, Discord, watch)
         if (getattr(args, '%s_discord_bot_token' % name) or '').strip():
             boardbot.start(board, args, name, Discord, watch)
             continue

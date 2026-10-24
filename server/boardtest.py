@@ -97,6 +97,7 @@ def main():
     try:
         run(st)
         run_bot(st)
+        run_fluxer(st)
     finally:
         db.close()
         shutil.rmtree(st, ignore_errors=True)
@@ -483,6 +484,61 @@ def run_bot(st):
         check('registry watch (unread=%s, stamps %s) restarts %d time(s)'
               % (unread, answers, want), len(exits) == want)
     polregistry.stamp = real_stamp
+
+
+def run_fluxer(st):
+    """The boards on Fluxer, beside Discord: no components there, the channels
+    are config, the status is a custom status."""
+    import boardbot
+    import boards
+    import polregistry
+    link = {'type': 1, 'components': [{'type': 2, 'style': 5, 'label': 'Open the board',
+                                       'url': 'https://board.example/#top'}]}
+    out = boardbot.fluxer_payload({'embeds': [{'title': 'E2', 'description': 'scores'}],
+                                   'components': [link]})
+    check('fluxer: the components go, the link button is a link under the embed',
+          'components' not in out
+          and out['embeds'][0]['description'].endswith('[Open the board](https://board.example/#top)'))
+    out = boardbot.fluxer_payload({'content': 'x', 'components': [
+        {'type': 1, 'components': [{'type': 2, 'style': 1, 'custom_id': 'r|top'}]}]})
+    check('fluxer: a button only Discord can answer just goes', out == {'content': 'x'})
+
+    hook = FakeHook()
+    path = os.path.join(st, 'fluxer_state.json')
+    d = boards.Discord('ddre2-fluxer', boardbot.FLUXER_API + '/channels/900', path,
+                       opener=hook, auth='FTOK', fluxer=True)
+    d.tick('s1', lambda: ({'embeds': [{'title': 'E2'}], 'components': [link]}, []), force=True)
+    method, url, body = hook.calls[-1]
+    check('fluxer: the board is posted in the Fluxer channel',
+          method == 'POST' and url == boardbot.FLUXER_API + '/channels/900/messages')
+    check('fluxer: ...with no components, the link in the text',
+          b'components' not in body and b'[Open the board](https://board.example/#top)' in body)
+
+    p = boardbot.FluxerPresence('ddre2-fluxer', 'T', text='3 players online')
+    pd = p._presence_payload()['d']
+    check('fluxer: the status is a custom status, not an activity',
+          pd.get('custom_status') == {'text': '3 players online'} and 'activities' not in pd)
+
+    os.environ['DDR_BOARDS_E2_FLUXER_CHANNELS'] = '111'
+    args = boards.build_parser().parse_args(['--state-dir', st])
+    check('fluxer: a board reads its Fluxer channels from the environment',
+          args.e2_fluxer_channels == '111' and args.e2_fluxer_bot_token == '')
+    saved = (polregistry.enabled, polregistry.get, polregistry.applied, polregistry.watch)
+    told = []
+    polregistry.enabled = lambda: True
+    polregistry.get = lambda bot: {'token': '', 'fluxer_token': 'reg-flux', 'updated_at': '1',
+                                   'fluxer_channels': json.dumps({'ddre2': '222,333'})}
+    polregistry.applied = lambda *a, **k: told.append(a) or True
+    polregistry.watch = lambda bots, unread=False: None
+    try:
+        boardbot.use_registry(args, ['e2'])
+    finally:
+        polregistry.enabled, polregistry.get, polregistry.applied, polregistry.watch = saved
+        os.environ.pop('DDR_BOARDS_E2_FLUXER_CHANNELS', None)
+    check('fluxer: the registry\'s Fluxer token and channels win over the environment',
+          (args.e2_fluxer_bot_token, args.e2_fluxer_channels) == ('reg-flux', '222,333'))
+    check('fluxer: ...and the admin page is told so',
+          told and told[-1][4:] == ('registry', {'ddre2': '222,333'}))
 
 
 if __name__ == '__main__':

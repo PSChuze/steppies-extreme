@@ -42,6 +42,15 @@ import polregistry
 
 DISCORD_API = 'https://discord.com/api/v10'
 
+#: Fluxer, beside Discord. Its message API is Discord's shape, with three gaps
+#: that decide what the boards do there: no components (a button is dropped, so
+#: link buttons become links in the text), no slash commands (the channels are
+#: config: --<name>-fluxer-channels, or the registry), and no activities (the
+#: status is a custom status).
+FLUXER_API = os.environ.get('DDR_BOARDS_FLUXER_API', 'https://api.fluxer.app/v1')
+FLUXER_GATEWAY = os.environ.get('DDR_BOARDS_FLUXER_GATEWAY',
+                                'wss://gateway.fluxer.app/?v=1&encoding=json')
+
 #: Manage Server or Administrator: who may move a board
 MOVERS = 0x20 | 0x8
 
@@ -359,13 +368,71 @@ def bot_message(board, args, name):
 NEWS_WINDOW = 24 * 3600
 
 
-def run_news(board, args, name, token, discord_cls, every=60.0, rounds=None):
+def fluxer_payload(payload):
+    """A Discord message for Fluxer: the components go, and each link button
+    becomes a [label](url) line under the last embed (or the text)."""
+    out = dict(payload)
+    links = []
+    for row in out.pop('components', None) or []:
+        for c in (row or {}).get('components') or []:
+            if c.get('type') == 2 and c.get('style') == 5 and c.get('url'):
+                links.append('[%s](%s)' % (c.get('label') or c['url'], c['url']))
+    if not links:
+        return out
+    line = ' · '.join(links)
+    if out.get('embeds'):
+        out['embeds'] = [dict(e) for e in out['embeds']]
+        last = out['embeds'][-1]
+        last['description'] = ('%s\n\n%s' % (last.get('description') or '', line)).strip()[:4096]
+    else:
+        out['content'] = ('%s\n%s' % (out.get('content') or '', line)).strip()[:4000]
+    return out
+
+
+class FluxerPresence(discordgw.Presence):
+    """The same Gateway session on Fluxer, whose presence is a custom status."""
+
+    def _presence_payload(self):
+        return {'op': 3, 'd': {'status': self.status, 'afk': False,
+                               'custom_status': {'text': self._want} if self._want else None}}
+
+
+def _ids(text):
+    return [c.strip() for c in (text or '').split(',') if c.strip()]
+
+
+def start_fluxer(board, args, name, discord_cls, watch_fn):
+    """The board on Fluxer: its status, a post per configured channel (its own
+    state file each, never shared with a Discord one), and its announcements."""
+    bot = bot_name(args, name)
+    token = (getattr(args, '%s_fluxer_bot_token' % name, '') or '').strip()
+    FluxerPresence(bot + '-fluxer', token, url=FLUXER_GATEWAY,
+                   status_fn=lambda: count_text(_online(board, args))).start()
+    message = bot_message(board, args, name)
+    chans = _ids(getattr(args, '%s_fluxer_channels' % name, ''))
+    for cid in chans:
+        d = discord_cls(bot + '-fluxer', '%s/channels/%s' % (FLUXER_API, cid),
+                        os.path.join(args.state_dir, 'boards', '%s_fluxer_%s.json' % (bot, cid)),
+                        args.discord_every, args.discord_event_ttl, args.discord_refresh,
+                        auth=token, fluxer=True)
+        threading.Thread(target=watch_fn, args=(board, args, d), kwargs={'message_fn': message},
+                         name='fluxer-%s-%s' % (bot, cid), daemon=True).start()
+    news = _ids(getattr(args, '%s_fluxer_news_channels' % name, ''))
+    if news and hasattr(board, 'news'):
+        threading.Thread(target=run_news, args=(board, args, name, token, discord_cls),
+                         kwargs={'fluxer': news}, name='fluxer-news-' + bot, daemon=True).start()
+    log('%s: on Fluxer too, in %d channel(s)%s' % (bot, len(chans),
+                                                 ', news in %d' % len(news) if news else ''))
+
+
+def run_news(board, args, name, token, discord_cls, every=60.0, rounds=None, fluxer=None):
     """Post each of board.news(snap) once, in every server's news channel,
     with the picture of its view. What was announced is kept in the state
     directory. On the very first run everything already happened is marked
     as told, so turning the feature on does not post a backlog."""
     bot = bot_name(args, name)
-    path = os.path.join(args.state_dir, 'boards', '%s_news.json' % bot)
+    path = os.path.join(args.state_dir, 'boards',
+                        '%s_%snews.json' % (bot, 'fluxer_' if fluxer else ''))
     try:
         with open(path, encoding='utf-8') as fh:
             told = json.load(fh).get('told') or []
@@ -374,6 +441,7 @@ def run_news(board, args, name, token, discord_cls, every=60.0, rounds=None):
         told, first = [], True
     call = discord_cls(bot, '', os.devnull, auth=token)._call
     url = (getattr(args, '%s_url' % name, '') or '').strip()
+    where = ({'fluxer:%s' % c: c for c in fluxer}, FLUXER_API) if fluxer else None
     n = 0
     while rounds is None or n < rounds:
         n += 1
@@ -386,7 +454,7 @@ def run_news(board, args, name, token, discord_cls, every=60.0, rounds=None):
                 due, first = [], False
             for item in due:
                 if now - item['at'] <= NEWS_WINDOW:
-                    post_news(board, args, name, bot, snap, item, call, url)
+                    post_news(board, args, name, bot, snap, item, call, url, where)
                 told.append(item['key'])
             if due or n == 1:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -399,11 +467,12 @@ def run_news(board, args, name, token, discord_cls, every=60.0, rounds=None):
             time.sleep(every)
 
 
-def post_news(board, args, name, bot, snap, item, call, url):
+def post_news(board, args, name, bot, snap, item, call, url, where=None):
     """One announcement, with its screen attached, in each server's news
-    channel. Unlike the board's own status posts these stay."""
+    channel. Unlike the board's own status posts these stay. `where` is
+    ({key: channel}, api) for Fluxer's channels instead of Discord's."""
     import boards
-    targets = channels(args)['news'].get(bot) or {}
+    targets, api = where or (channels(args)['news'].get(bot) or {}, DISCORD_API)
     if not targets:
         return
     files = []
@@ -420,9 +489,11 @@ def post_news(board, args, name, bot, snap, item, call, url):
         payload['components'] = [{'type': 1, 'components': [
             {'type': 2, 'style': 5, 'label': 'Open the board',
              'url': '%s#%s' % (url.rstrip('/') + '/', item['view'])}]}]
+    if where:
+        payload = fluxer_payload(payload)
     body, ctype = boards.multipart(payload, files)
     for guild, cid in targets.items():
-        st, data = call('POST', '%s/channels/%s/messages' % (DISCORD_API, cid), body, ctype)
+        st, data = call('POST', '%s/channels/%s/messages' % (api, cid), body, ctype)
         log('%s: announced %s in server %s (%s)' % (bot, item['key'], guild, st))
 
 
@@ -545,9 +616,15 @@ def use_registry(args, names):
             row = None
             unread = True
         for field, attr in (('token', '%s_discord_bot_token'), ('app_id', '%s_discord_app_id'),
-                            ('public_key', '%s_discord_public_key'), ('url', '%s_url')):
+                            ('public_key', '%s_discord_public_key'), ('url', '%s_url'),
+                            ('fluxer_token', '%s_fluxer_bot_token')):
             if row and row.get(field):
                 setattr(args, attr % name, row[field])
+        # a channel list the registry names wins; one it does not name keeps the
+        # environment's
+        for key, ids in polregistry.fluxer_channels(row).items():
+            if key == bot:
+                setattr(args, '%s_fluxer_channels' % name, ids)
         if row and row.get('has_token') and not row.get('token'):
             log('%s: the registry\'s token cannot be unsealed here (POL_BOT_KEY missing or '
                 'different); using the environment' % bot)
@@ -557,7 +634,11 @@ def use_registry(args, names):
             row_at = float((row or {}).get('updated_at') or 0)
         except ValueError:
             row_at = 0.0
+        ftoken = (getattr(args, '%s_fluxer_bot_token' % name, '') or '').strip()
+        fsource = 'registry' if row and row.get('fluxer_token') else ('env' if ftoken else '')
+        fchans = (getattr(args, '%s_fluxer_channels' % name, '') or '').strip()
         polregistry.applied(bot, source, (getattr(args, '%s_discord_app_id' % name, '')
-                                          or '').strip(), row_at)
+                                          or '').strip(), row_at,
+                            fsource, {bot: fchans} if fchans else {})
         log('%s: credentials from %s' % (bot, source or 'nowhere (no bot)'))
     return polregistry.watch(bots, unread=unread)

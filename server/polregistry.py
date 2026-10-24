@@ -280,14 +280,34 @@ def get(name):
     """The registry row for `name` with its token unsealed ('' if it cannot
     be; has_token says whether one is stored), or None."""
     with _db() as db:
-        rows = db.query('SELECT name, token_sealed, app_id, public_key, url, updated_at '
-                        'FROM discord_bot WHERE name = %s' % _literal(name))
+        try:
+            rows = db.query('SELECT name, token_sealed, app_id, public_key, url, updated_at, '
+                            'fluxer_token_sealed, fluxer_channels '
+                            'FROM discord_bot WHERE name = %s' % _literal(name))
+        except PgError:
+            # a registry from before its Fluxer columns: the Discord side alone
+            rows = None
+    if rows is None:
+        with _db() as db:
+            rows = db.query('SELECT name, token_sealed, app_id, public_key, url, updated_at '
+                            'FROM discord_bot WHERE name = %s' % _literal(name))
     if not rows:
         return None
     r = rows[0]
     sealed = r.pop('token_sealed') or ''
-    r.update(token=unseal(sealed), has_token=bool(sealed))
+    fsealed = r.pop('fluxer_token_sealed', '') or ''
+    r.update(token=unseal(sealed), has_token=bool(sealed),
+             fluxer_token=unseal(fsealed), fluxer_has_token=bool(fsealed))
     return r
+
+
+def fluxer_channels(row):
+    """{feed key: "id,id"} from a row's fluxer_channels; {} when there are none."""
+    try:
+        got = json.loads((row or {}).get('fluxer_channels') or '{}')
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in got.items()} if isinstance(got, dict) else {}
 
 
 def stamp(names):
@@ -373,7 +393,8 @@ def kv_set(key, value, ttl=None):
         return False
 
 
-def applied(name, source, app_id, row_at):
+def applied(name, source, app_id, row_at, fluxer_source='', fluxer_channels=None):
     """What the admin page reads to show a bot as live: botcreds:applied:<name>."""
     return kv_set('botcreds:applied:%s' % name, json.dumps(
-        {'source': source, 'at': time.time(), 'app_id': app_id, 'row_at': row_at}))
+        {'source': source, 'at': time.time(), 'app_id': app_id, 'row_at': row_at,
+         'fluxer_source': fluxer_source, 'fluxer_channels': fluxer_channels or {}}))

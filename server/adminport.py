@@ -43,6 +43,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import boarddata
 import content
 import db
 import schedule
@@ -111,6 +112,19 @@ class Hooks:
     def song_count(self, game):
         return schedule.SN2_SONG_IDS if game == 'sn2' else self.g.SN_SONG_COUNT
 
+    def song_titles(self, game):
+        """{song id: title} from the boards' baked disc art (boardart/<game>
+        beside the state file), or {} when no disc has been baked."""
+        state = getattr(self.g, 'STATE_PATH', '') or ''
+        if not state:
+            return {}
+        index = boarddata.art(os.path.join(os.path.dirname(state), 'boardart', game))
+        out = {}
+        for k, v in (index.get('songs') or {}).items():
+            if str(k).isdigit() and v:
+                out[int(k)] = str(v)
+        return out
+
     def player_files(self):
         """[(account key, player file)] for every dancer on the server."""
         with self.g.STATE_LOCK:
@@ -166,8 +180,7 @@ def events(h, lo, hi):
         out.append({'id': 'e2-rc-%d' % start,
                     'title': 'Ranking Challenge, week %d' % week,
                     'start': start, 'end': start + week_s, 'kind': 'challenge',
-                    'about': 'Extreme 2: the weekly Ranking Challenge, two '
-                             'cards of songs with their own ranking.'})
+                    'about': 'Extreme 2, two song cards, ranked separately.'})
     now = int(time.time())
     for game in ('sn', 'sn2'):
         for c in h.competitions(game, now):
@@ -199,7 +212,7 @@ def find_players(h, q, limit):
             continue
         rows.append({'id': str(pid), 'label': name or '?',
                      'detail': ('online in %s' % online[pid]) if pid in online
-                     else 'dancer %s' % pid,
+                     else 'offline',
                      'online': pid in online})
     rows.sort(key=lambda r: (not r['online'], r['label'].lower()))
     return rows[:limit]
@@ -222,7 +235,7 @@ def player(h, who):
         if acct not in accounts:
             continue
         pid = f.get('id')
-        facts = [{'label': 'dancer id', 'value': pid}]
+        facts = [{'label': 'Dancer ID', 'value': pid}]
         try:
             s = db.player_stats(pid, week)
             facts += [{'label': 'Extreme 2 matches', 'value': s['match_total']},
@@ -289,8 +302,8 @@ def announce(h, params, actor, log):
     msg = 'Shown in the lobby chat to %d player%s.' % (
         reached, '' if reached == 1 else 's')
     if skipped:
-        msg += (' %d Extreme 2 player%s did not see it: that game has no '
-                'chat.' % (skipped, '' if skipped == 1 else 's'))
+        msg += (' Not shown to %d Extreme 2 player%s.'
+                % (skipped, '' if skipped == 1 else 's'))
     return True, msg
 
 
@@ -349,6 +362,18 @@ textarea{width:min(100%,36em);min-height:5em}
 button{font:inherit;padding:6px 14px;border-radius:8px;border:1px solid var(--accent);
 background:var(--accent);color:var(--on);cursor:pointer}
 button.quiet{background:var(--box2);border-color:var(--line);color:var(--bad)}
+button.sure{background:var(--bad);border-color:var(--bad);color:var(--on)}
+details.confirm{display:inline-block}
+details.confirm>summary{display:inline-block;list-style:none;padding:6px 14px;border-radius:8px;
+border:1px solid var(--line);background:var(--box2);color:var(--bad);cursor:pointer}
+details.confirm>summary::-webkit-details-marker{display:none}
+details.confirm[open]>summary{border-color:var(--bad)}
+details.confirm>span{margin:0 8px 0 10px;font-size:13px;color:var(--muted)}
+details.confirm>button{margin-top:6px}
+details.more{margin:10px 0 0}
+details.more>summary{cursor:pointer;color:var(--accent);font-weight:500}
+details.more[open]>summary{margin-bottom:8px}
+.slots{display:flex;flex-wrap:wrap;gap:8px}
 """
 
 
@@ -389,12 +414,55 @@ def field(name, label, value='', kind='input'):
     return '<label>%s%s</label>' % (esc(label), box)
 
 
-def button(text, hidden=None, quiet=False):
-    """A one-button form, for delete-style actions inside a table."""
+def button(text, hidden=None, quiet=False, confirm=''):
+    """A one-button form, for delete-style actions inside a table. With
+    `confirm`, the first click only opens that question and a second button
+    that posts (the page has no script to ask)."""
     hid = ''.join('<input type=hidden name="%s" value="%s">' % (esc(k), esc(v))
                   for k, v in (hidden or {}).items())
+    if confirm:
+        yes = 'Yes, ' + text[:1].lower() + text[1:]
+        return ('<form method=post class=inline>%s<details class=confirm>'
+                '<summary>%s</summary><span>%s</span><button class=sure>%s'
+                '</button></details></form>' % (hid, esc(text), esc(confirm), esc(yes)))
     return ('<form method=post class=inline>%s<button%s>%s</button></form>'
             % (hid, ' class=quiet' if quiet else '', esc(text)))
+
+
+def fold(summary, *parts):
+    """Part of a page that stays folded until its summary is clicked."""
+    return '<details class=more><summary>%s</summary>%s</details>' % (
+        esc(summary), ''.join(parts))
+
+
+def song_choices(h, game, count, bad=()):
+    """[(id, title)] of the songs that can be picked, by title. A song the
+    baked disc art does not name is "Song <id>"."""
+    titles = h.song_titles(game)
+    out = [(i, titles.get(i) or 'Song %d' % i) for i in range(count) if i not in bad]
+    return sorted(out, key=lambda c: (c[0] not in titles, c[1].lower() if c[0] in titles else c[0]))
+
+
+def song_names(choices, ids):
+    names = dict(choices)
+    return ', '.join(names.get(i, 'Song %d' % i) for i in ids)
+
+
+def song_slots(prefix, choices, chosen=(), slots=10):
+    """`slots` song pickers in play order, named <prefix>_0 .. _<slots-1>."""
+    out = []
+    for k in range(slots):
+        want = chosen[k] if k < len(chosen) else None
+        opts = ''.join('<option value=%d%s>%s' % (i, ' selected' if i == want else '', esc(t))
+                       for i, t in choices)
+        out.append('<label>Song %d<select name="%s_%d"><option value="">-%s</select></label>'
+                   % (k + 1, esc(prefix), k, opts))
+    return '<div class=slots>%s</div>' % ''.join(out)
+
+
+def _slots(f, prefix, slots=10):
+    """The song pickers' answers as the comma list the text field used to send."""
+    return ','.join(f.get('%s_%d' % (prefix, k), '') for k in range(slots))
 
 
 def posted(body):
@@ -431,18 +499,22 @@ def rankings_page(h, method, body, actor, log):
     parts.append(section('Extreme 2 head to head, all time',
                          table(['Rank', 'Dancer', 'Points', 'Wins', 'Draws',
                                 'Losses'], rows)))
+    past = []
     for game in ('sn', 'sn2'):
         for c in h.competitions(game, now):
             if c['start'] > now:
                 continue
             rows = [[r['rank'], esc(r['name']), r['score'], r['stages']]
                     for r in db.sn_comp_board(c['id'], 50, now)]
-            state = 'open' if now < c['end'] else 'ended'
-            parts.append(section('%s: %s (%s)' % (GAME_TITLE[game],
-                                                  c['name'] or 'Tournament',
-                                                  state),
-                                 table(['Rank', 'Dancer', 'Total', 'Stages'],
-                                       rows)))
+            box = section('%s: %s' % (GAME_TITLE[game], c['name'] or 'Tournament'),
+                          table(['Rank', 'Dancer', 'Total', 'Stages'], rows))
+            if now < c['end']:
+                parts.append(box)
+            else:
+                past.append((c['end'], box))
+    if past:
+        past.sort(key=lambda x: -x[0])
+        parts.append(fold('Past tournaments (%d)' % len(past), *[b for _e, b in past]))
     return page('Rankings', ''.join(parts))
 
 
@@ -477,21 +549,22 @@ def content_page(h, method, body, actor, log):
         elif what == 'rc':
             rc = _rc_override(f)
             note = (True, 'Saved.' if rc else
-                    'Nothing set, so the generated lineup is back.')
+                    'Nothing set. The weekly lineup is back.')
         elif what == 'rc-clear':
             rc = {}
-            note = (True, 'The generated lineup is back.')
+            note = (True, 'The weekly lineup is back.')
         if note and note[0]:
             content.save({'news': news, 'rc': rc or None, 'info': info})
             log('admin: %s changed content (%s)' % (actor or '?', what))
     week = schedule.rc_week()[0]
+    rc_songs = song_choices(h, 'e2', schedule.RC_SONG_IDS, schedule.RC_BAD_SONG_IDS)
     parts = [
         section('News',
-                '<p class=muted>Shown in every game after login. With none '
-                'here, the built-in news is shown.</p>',
+                '<p class=muted>Shown after login. If empty, the built-in news shows.</p>',
                 table(['Title', 'Text', ''],
                       [[esc(n['title']), esc(n.get('body', '')),
-                        button('Remove', {'do': 'news-del', 'i': i}, True)]
+                        button('Remove', {'do': 'news-del', 'i': i}, True,
+                               'Remove this news item?')]
                        for i, n in enumerate(news)]),
                 '<form method=post><input type=hidden name=do value=news>%s%s'
                 '<button>Add</button></form>'
@@ -500,30 +573,31 @@ def content_page(h, method, body, actor, log):
         section('SuperNOVA server information',
                 table(['Title', 'Text', ''],
                       [[esc(n['title']), esc(n.get('body', '')),
-                        button('Remove', {'do': 'info-del', 'i': i}, True)]
+                        button('Remove', {'do': 'info-del', 'i': i}, True,
+                               'Remove this item?')]
                        for i, n in enumerate(info)]),
                 '<form method=post><input type=hidden name=do value=info>%s%s'
                 '<button>Add</button></form>'
                 % (field('title', 'Title'), field('body', 'Text', '',
                                                    'textarea'))),
         section('Extreme 2 Ranking Challenge, week %d' % week,
-                '<p class=muted>Songs are generated each week. Anything set '
-                'here replaces that part only: set a difficulty and the songs '
-                'still rotate. Song ids are 0 to %d, separated by commas. '
-                'Id 8 is left out: it hangs the game.</p>'
-                % (schedule.RC_SONG_IDS - 1),
+                '<p class=muted>Blank fields keep the weekly lineup.</p>',
                 '<form method=post><input type=hidden name=do value=rc>%s%s%s'
                 '<button>Save</button></form>'
-                % (''.join(field('songs%d' % i, 'Challenge %d (now %s)' % (
-                       i + 1, ', '.join(map(str, schedule.rc_auto_songs(week, i)))),
-                       ', '.join(map(str, (rc.get('songs') or {}).get(str(i), []))))
+                % (''.join(fold('Challenge %d: %s' % (
+                       i + 1, song_names(rc_songs, (rc.get('songs') or {}).get(str(i)) or
+                                         schedule.rc_auto_songs(week, i))
+                       + ('' if (rc.get('songs') or {}).get(str(i)) else ' (weekly)')),
+                       song_slots('songs%d' % i, rc_songs,
+                                  (rc.get('songs') or {}).get(str(i)) or [],
+                                  schedule.RC_ENTRIES))
                        for i in range(RC_CHALLENGES)),
                    field('difficulty', 'Difficulty (0 to 2)',
                          '' if rc.get('difficulty') is None else rc['difficulty']),
                    field('stages', 'Stages (1 to 10)',
                          '' if rc.get('stages') is None else rc['stages'])),
-                button('Go back to the generated lineup', {'do': 'rc-clear'},
-                       True)),
+                button('Use the weekly lineup', {'do': 'rc-clear'},
+                       True, 'Clear the changes made here?')),
     ]
     return page('News and events', ''.join(parts), note)
 
@@ -540,7 +614,8 @@ def _rc_override(f):
     rc = {}
     songs = {}
     for i in range(RC_CHALLENGES):
-        got = [x for x in _ints(f.get('songs%d' % i), 0, schedule.RC_SONG_IDS - 1)
+        raw = f.get('songs%d' % i) or _slots(f, 'songs%d' % i, schedule.RC_ENTRIES)
+        got = [x for x in _ints(raw, 0, schedule.RC_SONG_IDS - 1)
                if x not in schedule.RC_BAD_SONG_IDS]
         if got:
             songs[str(i)] = got
@@ -573,34 +648,41 @@ def tournaments_page(h, method, body, actor, log):
     for game in ('sn', 'sn2'):
         path = h.comp_file(game)
         own = bool(path) and os.path.exists(path)
-        rows = []
-        for c in sorted(h.competitions(game, now), key=lambda c: c['start']):
-            state = ('open' if c['start'] <= now < c['end'] else
-                     'coming' if c['start'] > now else 'ended')
-            rows.append([c['id'], esc(c['name']), state, _date(c['start']),
-                         _date(c['end']), esc(', '.join(map(str, c['songs']))),
-                         button('Remove', {'do': 'del', 'game': game,
-                                           'id': c['id']}, True)])
-        last = h.song_count(game) - 1
+        bad = schedule.SN2_BAD_SONG_IDS if game == 'sn2' else ()
+        choices = song_choices(h, game, h.song_count(game), bad)
+        comps = h.competitions(game, now)
+        live = sorted((c for c in comps if c['start'] <= now < c['end']), key=lambda c: c['start'])
+        coming = sorted((c for c in comps if c['start'] > now), key=lambda c: c['start'])
+        ended = sorted((c for c in comps if c['end'] <= now), key=lambda c: -c['end'])
+
+        def rows(cs, state):
+            return [[c['id'], esc(c['name']), state, _date(c['start']), _date(c['end']),
+                     esc(song_names(choices, c['songs'])),
+                     button('Remove', {'do': 'del', 'game': game, 'id': c['id']}, True,
+                            'Remove this tournament? Its results are kept.')]
+                    for c in cs]
+        heads = ['Id', 'Name', 'Now', 'Starts', 'Ends', 'Songs', '']
         parts.append(section(
             GAME_TITLE[game],
             '<p class=muted>%s</p>' % (
-                'This server runs its own list.' if own else
-                'These are generated from the calendar. Adding or removing '
-                'one switches to a list of your own, starting from these.'),
-            table(['Id', 'Name', 'Now', 'Starts', 'Ends', 'Songs', ''], rows),
+                'Custom list.' if own else
+                'Generated from the calendar. Any change starts a custom list.'),
+            table(heads, rows(live, 'open') + rows(coming, 'coming'),
+                  'No tournaments.'),
+            fold('Past tournaments (%d)' % len(ended), table(heads, rows(ended, 'ended')))
+            if ended else '',
             '<form method=post><input type=hidden name=do value=add>'
-            '<input type=hidden name=game value=%s>%s%s%s%s%s'
+            '<input type=hidden name=game value=%s>%s%s%s%s<div style="flex-basis:100%%">%s</div>'
             '<button>Add tournament</button></form>'
             % (game, field('name', 'Name'),
-               field('songs', 'Song ids, 0 to %d (up to 10)' % last),
                field('start', 'Starts (YYYY-MM-DD, UTC)',
                      time.strftime('%Y-%m-%d', time.gmtime(now))),
                field('days', 'Days', '7'),
                field('difficulty', 'Difficulty (0 beginner to 4 challenge)',
-                     '1')),
-            button('Go back to the generated ones', {'do': 'reset',
-                                                     'game': game}, True)
+                     '1'),
+               fold('Songs', song_slots('song', choices))),
+            button('Use the generated list', {'do': 'reset', 'game': game}, True,
+                   'Replace this list with the generated tournaments?')
             if own else ''))
     return page('Tournaments', ''.join(parts), note)
 
@@ -608,7 +690,7 @@ def tournaments_page(h, method, body, actor, log):
 def _change_tournaments(h, game, f, now):
     path = h.comp_file(game)
     if not path:
-        return False, 'The gate has no state folder to keep the list in.'
+        return False, 'This server cannot save a tournament list.'
     what = f.get('do')
     if what == 'reset':
         try:
@@ -625,18 +707,18 @@ def _change_tournaments(h, game, f, now):
         if len(keep) == len(comps):
             return False, 'That tournament is already gone.'
         comps = keep
-        msg = 'Removed. Its results stay in the database.'
+        msg = 'Removed. Its results are kept.'
     elif what == 'add':
         name = f.get('name', '').upper()[:30]
-        songs = _ints(f.get('songs'), 0, h.song_count(game) - 1)[:10]
+        songs = _ints(f.get('songs') or _slots(f, 'song'), 0, h.song_count(game) - 1)[:10]
         try:
             start = calmod.timegm(time.strptime(f.get('start', ''), '%Y-%m-%d'))
             days = int(f.get('days') or 7)
         except ValueError:
-            return False, 'The start date is YYYY-MM-DD and days a number.'
+            return False, 'Use YYYY-MM-DD for the date and a number of days.'
         diff = _ints(f.get('difficulty'), 0, 4)
         if not name or not songs or not 1 <= days <= 366:
-            return False, 'A name, at least one song and 1 to 366 days.'
+            return False, 'Needs a name, a song and 1 to 366 days.'
         if len(comps) >= h.g.SN_COMP_MAX:
             return False, 'The game shows at most %d tournaments.' % h.g.SN_COMP_MAX
         used = [c['id'] for c in comps]

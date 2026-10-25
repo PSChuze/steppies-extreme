@@ -1414,6 +1414,16 @@ def test_admin_port():
               code == 200 and [c['id'] for c in comps] == [1, 2]
               and comps[1]['name'] == 'SPRING CUP'
               and comps[1]['songs'] == [3, 4], comps)
+        code, page = call('/tournaments', {'do': 'add', 'game': 'sn',
+                                           'name': 'picked', 'song_0': '5',
+                                           'song_1': '', 'song_2': '2',
+                                           'start': day, 'days': '7'}, form=True)
+        comps = gate.sn_competitions(args, now)
+        check('admin: songs picked in the slots keep their play order',
+              code == 200 and comps[-1]['songs'] == [5, 2], comps)
+        check('admin: Remove asks first, with a second button',
+              page.count(b'<details class=confirm><summary>Remove</summary>') >= 3
+              and b'Yes, remove' in page and b'<script' not in page)
         call('/tournaments', {'do': 'reset', 'game': 'sn'}, form=True)
         check('admin: going back to generated removes the file',
               [c['id'] for c in gate.sn_competitions(args, now)] == [1])
@@ -1424,6 +1434,14 @@ def test_admin_port():
         call('/content', {'do': 'rc', 'songs0': '8, 9, 10'}, form=True)
         check('admin: the RC override drops the song that hangs the game',
               content.load()['rc']['songs'] == {'0': [9, 10]})
+        code, page = call('/content', {'do': 'rc', 'songs1_0': '12',
+                                       'songs1_1': '8', 'songs1_2': '3'},
+                          form=True)
+        check('admin: the RC song pickers save in order, without song 8',
+              content.load()['rc']['songs'] == {'1': [12, 3]})
+        check('admin: the pickers do not offer song 8',
+              b'<option value=8>' not in page and b'<option value=9>' in page
+              and b'Id 8' not in page)
         os.environ.pop('DDR_SUPERVISED', None)
         code, raw = call('/openlobby/update', {})
         check('admin: a server not run by the setup cannot update itself',

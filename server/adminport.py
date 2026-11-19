@@ -158,8 +158,10 @@ def status(h):
                               'state': 'open'})
     out = {'up': True, 'online': len(players), 'players': players,
            'rooms': rooms, 'rooms_label': 'events',
-           'summary': ', '.join('%s %d' % (GAME_TITLE[g], counts[g])
-                                for g, _ in GAMES),
+           # who is on which game, only the games someone is on: the online tile
+           # already says when nobody is
+           'summary': ', '.join('%d on %s' % (counts[g], GAME_TITLE[g])
+                                for g, _ in GAMES if counts[g]),
            'facts': [{'label': 'dancers', 'value': len(h.player_files())}]}
     update = updates.status_block(h.updates, h.state_dir())
     if update is not None:

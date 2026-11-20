@@ -3236,6 +3236,8 @@ class Session(threading.Thread):
         self.start_ready = False  # has sent 0x4410 GetStartStaus
         self.start_sent = False   # has been given the 0x4412 PLAY START gate
         self.start_held = False   # SuperNOVA: 0x4411 withheld until the peer readies
+        self.load_held = False    # SuperNOVA: 0x4414 withheld until the peer has loaded
+        self.load_gen = 0         # which hold a load timer belongs to
         self.sn_comp_sel = None   # SuperNOVA: competition id from the last 0x5000
         self.sn_board_req = (None, 100)   # SuperNOVA: (competition, rows), 0x5040
         self.sn_standing_comp = None      # SuperNOVA: competition from 0x5020
@@ -3322,6 +3324,9 @@ class Session(threading.Thread):
         self.observe(opcode, payload)
         if opcode == 0x4410 and self.is_sn and self.hold_sn_start():
             return
+        if (opcode == 0x4413 and self.is_sn and not self.is_sn2
+                and self.hold_sn_loaded()):
+            return
         # SuperNOVA 2's 0x4430 has a different shape (s32, s32, s16, s16, u16,
         # s16, s16), so the verdict hold is SuperNOVA's alone until that report
         # is decoded.
@@ -3405,6 +3410,9 @@ class Session(threading.Thread):
             # "other player is ready" signal is 0x4412 exactly as in Extreme 2
             # (one u8 -> ctx+0x14268, read at 0x00a4a8b4).
             self.maybe_start_match()
+        if (opcode == 0x4432 and self.is_sn and not self.is_sn2
+                and not self.args.sn_keep_room_lock):
+            self.unlock_sn_room()
 
     def try_unseen_pushes(self):
         """Fire the two push-only opcodes NOTHING has ever sent, if asked.
@@ -3879,6 +3887,10 @@ class Session(threading.Thread):
         if not self.is_sn or self.peer is None:
             return
         peer = self.peer
+        # A player left mid-load: the one still waiting on our 0x4413 starts
+        # now rather than after --sn-load-wait.
+        peer.release_sn_load('%s is gone' % self.who())
+        self.load_held = False
         self.relay_release()
         with WAITING_LOCK:
             if peer.peer is self:
@@ -4128,6 +4140,98 @@ class Session(threading.Thread):
         self.push_later(peer, 0x4412, self.sn_ready_body(1),
                         self.args.start_delay)
         return True
+
+    def hold_sn_loaded(self):
+        """SuperNOVA: hold this side's `0x4414` until the opponent has loaded.
+
+        Returns True when the reply is being held; the caller then sends
+        nothing.
+
+        **`0x4413` is "I have loaded the song", and `0x4414` is the start.**
+        After the peer link is up each console loads the song, then sends
+        `0x4413` (builder `0x0026ef10`, called from `0x00a544c0`; it zeroes
+        ctx+0x1426c and sends one constant byte, 2) and waits in
+        `0x00a52c50` / `0x00a53850`: at least 200 frames, then until
+        ctx+0x1426c is non-zero, for up to `0xe11` frames (about a minute).
+        The `0x4414` parser (`0x0026eea0`) is what sets it: status 0 writes
+        1 there and raises the flag at ctx+0x142fc.
+
+        So the song starts when this reply lands, and answering each `0x4413`
+        at once starts each console as soon as IT has loaded. On the
+        2026-11-19 stream (85 matches, an HDD, a Memcard Pro 2 and PCSX2)
+        the gap between the two `0x4413`s matched the gap between the two
+        end-of-song `0x4430`s to 0.07 s on average: 2 s typically, 12 s at
+        worst. That is the "music out of sync", and the scores and the
+        verdict drifted with it. Extreme 2 never had this, because its
+        `0x4412` gate is the same kind of barrier and the server always
+        timed it.
+
+        The first `0x4413` is held and the second releases both, the way
+        hold_sn_start pairs the `0x4411`s. --sn-load-wait bounds the hold,
+        well inside the client's own minute.
+        """
+        if self.args.sn_load_open:
+            return False
+        with WAITING_LOCK:
+            peer = self.peer
+            if peer is None:
+                return False          # nobody to wait for
+            release = peer.load_held
+            if release:
+                peer.load_held = False
+            else:
+                self.load_held = True
+                self.load_gen += 1
+                gen = self.load_gen
+        if release:
+            self.log('     both sides loaded, releasing the 0x4414 held for '
+                     '%s alongside this reply' % peer.who())
+            peer.push(0x4414, struct.pack('>I', 0))
+            return False
+        self.log('     loaded; start held until %s has loaded too'
+                 % peer.who())
+        threading.Thread(target=self.sn_load_timeout, args=(gen,),
+                         daemon=True).start()
+        return True
+
+    def sn_load_timeout(self, gen):
+        """Release a held `0x4414` whose opponent never finished loading."""
+        time.sleep(self.args.sn_load_wait)
+        self.release_sn_load('the opponent never finished loading', gen)
+
+    def release_sn_load(self, why, gen=None):
+        """Send this side's held `0x4414` now, if one is held. `gen` limits
+        a timer to the hold that started it."""
+        with WAITING_LOCK:
+            if not self.load_held or (gen is not None
+                                      and gen != self.load_gen):
+                return
+            self.load_held = False
+        self.log('     %s: starting alone (0x4414)' % why)
+        self.push(0x4414, struct.pack('>I', 0))
+
+    def unlock_sn_room(self):
+        """SuperNOVA: push `0x4434` after a match to unlock the room screen.
+
+        The `0x4414` that starts a song also raises ctx+0x142fc, and nothing
+        the server sent ever lowered it again. Both room scenes read it every
+        frame. The guest's input handler (`0x00a4ca6c`) ignores the pad while
+        it is set, and its back button (`0x00a4d180`) takes another path. The
+        owner's scene (`0x00a582b8`) greys its menu items and clears the flag
+        only on its "guest left" path (`0x00a584d0`). So after every match
+        both players sat in a room that took no input until the guest
+        left, which clears the flag again (`0x4324`, `0x4325`, `0x4331` and
+        sending `0x4a00` all do). On the 2026-11-19 stream one of the two
+        left the room after 82 of 85 matches, and the guest rejoined.
+
+        The flag's own clear is the `0x4434` parser (`0x0026eb30`, a plain
+        case of the dispatch at `0x002722bc`, no in-flight check): status 0
+        zeroes ctx+0x142fc. Both players send `0x4432` as they leave the
+        result screen, so each is unlocked then, after its `0x4433` reply.
+        """
+        self.log('     match over: unlocking the room (0x4434)')
+        self.push_later(self, 0x4434, struct.pack('>I', 0),
+                        self.args.start_delay)
 
     def sn2_id(self):
         return (self.player or {}).get('id', 0)
@@ -5903,6 +6007,22 @@ def main():
                          'Holding is what starts the two peer connects '
                          'together (see hold_sn_start); this restores '
                          'the old behaviour for comparison.')
+    ap.add_argument('--sn-load-open', action='store_true',
+                    help='SuperNOVA only: answer each 0x4413 at once '
+                         'instead of holding the first until the opponent '
+                         'has loaded too. The 0x4414 reply is what starts '
+                         'the song, so holding it starts both together '
+                         '(see hold_sn_loaded); this restores the old '
+                         'behaviour for comparison.')
+    ap.add_argument('--sn-load-wait', type=float, default=20.0,
+                    help='SuperNOVA: the longest to hold a player\'s 0x4414 '
+                         'waiting for the opponent to finish loading, in '
+                         'seconds. The client gives up by itself after '
+                         'about a minute (default 20).')
+    ap.add_argument('--sn-keep-room-lock', action='store_true',
+                    help='SuperNOVA only: do not push 0x4434 after a match. '
+                         'Without it the room ignores input until the guest '
+                         'leaves (see unlock_sn_room); for comparison only.')
     ap.add_argument('--sn-endgame-wait', type=float, default=8.0,
                     help='SuperNOVA: the longest to hold a player\'s '
                          '0x4431 GetEndgame reply waiting for the '

@@ -1197,6 +1197,47 @@ def test_db_and_results():
         check('SN endgame: timeout answers with a win',
               pushed == [('ALPHA', 0x4431, struct.pack('>IB', 0, 0))]
               and not c.endgame_held, pushed)
+        # SuperNOVA: 0x4414 starts the song, so the first 0x4413 ("loaded")
+        # is held and the second releases both together.
+        args.sn_load_open, args.sn_load_wait = False, 0.2
+        args.start_delay = 0          # push_later sends at once
+        for f in (c, e):
+            f.load_held, f.load_gen = False, 0
+            for m in ('hold_sn_loaded', 'sn_load_timeout', 'release_sn_load',
+                      'unlock_sn_room', 'push_later'):
+                setattr(f, m, types.MethodType(getattr(gate.Session, m), f))
+        del pushed[:]
+        check('SN load: first 0x4413 is held', c.hold_sn_loaded())
+        check('SN load: second 0x4413 is answered at once',
+              not e.hold_sn_loaded())
+        check('SN load: the held side gets its 0x4414 on the second',
+              pushed == [('ALPHA', 0x4414, struct.pack('>I', 0))]
+              and not c.load_held, pushed)
+        del pushed[:]
+        check('SN load: held while the opponent is still loading',
+              e.hold_sn_loaded())
+        time.sleep(0.5)
+        check('SN load: timeout starts the held side alone',
+              pushed == [('beta', 0x4414, struct.pack('>I', 0))]
+              and not e.load_held, pushed)
+        # A timer from an earlier hold must not release a later one.
+        del pushed[:]
+        c.load_held, c.load_gen = True, 2
+        c.release_sn_load('stale timer', 1)
+        check('SN load: a stale timer leaves a newer hold alone',
+              pushed == [] and c.load_held, pushed)
+        c.load_held = False
+        args.sn_load_open = True
+        check('SN load: --sn-load-open answers at once', not c.hold_sn_loaded())
+        args.sn_load_open = False
+        c.peer = None
+        check('SN load: no opponent, no hold', not c.hold_sn_loaded())
+        c.peer = e
+        # After the match, 0x4434 lowers the room lock 0x4414 raised.
+        del pushed[:]
+        c.unlock_sn_room()
+        check('SN room: 0x4434 status 0 unlocks the room after a match',
+              pushed == [('ALPHA', 0x4434, struct.pack('>I', 0))], pushed)
         # The reply body carries whatever the pairing decided, then resets.
         e.sn_verdict = 1
         e.payload_for = types.MethodType(gate.Session.payload_for, e)

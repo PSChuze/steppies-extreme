@@ -464,7 +464,7 @@ readers in the overlay at base `0x00a46000`:
 | flag | set by push | read at | body |
 |---|---|---|---|
 | `ctx+0x142f4` | `0x4411` | `00a4c658`, `00a4d824`, `00a5a4dc`, `00a5b964` | GetStartStaus reply, 7 B |
-| `ctx+0x142fc` | `0x4414` | `00a4a8f0`, `00a4ca6c`, `00a4d180`, `00a582b8`, `00a5a8d8`, `00a5b29c` | `u32` status |
+| `ctx+0x142fc` | `0x4414` (cleared by `0x4434`) | `00a4a8f0`, `00a4ca6c`, `00a4d180`, `00a582b8`, `00a5a8d8`, `00a5b29c` | `u32` status; the room lock, see [Loading, and the room after a match](#loading-and-the-room-after-a-match) |
 | `ctx+0x142fd` | **`0x4a04`** | `00a47908` | **67 B match record** |
 | `ctx+0x142fe` | **`0x4a13`** | `00a4791c` | **67 B match record** |
 | `ctx+0x142ff` | `0x4325` | `00a53b88`, `00a57bf8` | 49 B player record |
@@ -779,6 +779,40 @@ opponent `0x4412 = 0` to put the light out.
 record at `ctx+0x141b0` and raises `ctx+0x14300`, and both room scenes then
 clear the other player's slot. The server sends it to the remaining player on
 `0x4340` OutRoom and when a connection drops.
+
+#### Loading, and the room after a match
+
+Read out of `SLUS_213.77` and `DATA04.BIN` on 2026-11-20 and checked against
+the server log of an 85-match session the night before.
+
+After the peer link is up, each console loads the song and then sends
+`0x4413` (builder `0x0026ef10`, called from `0x00a544c0`). The body is one
+constant byte, 2, and the builder zeroes `ctx+0x1426c` first. The console then
+waits (`0x00a52c50`, `0x00a53850`): at least 200 frames, then until
+`ctx+0x1426c` is non-zero, for up to `0xe11` frames, about a minute. The
+`0x4414` parser (`0x0026eea0`) sets it. Status 0 writes 1 there and raises
+`ctx+0x142fc`; a non-zero status is stored instead and raises nothing.
+
+So **`0x4414` is the start signal**, the counterpart of Extreme 2's `0x4412`.
+Answered at once, each console starts the moment it alone has loaded. In that
+session the gap between the two `0x4413`s matched the gap between the two
+`0x4430`s to 0.07 s on average (2 s typically, 12 s at worst, with an HDD,
+a Memcard Pro 2 and PCSX2). The server now holds the first `0x4413` and
+answers both when the second arrives (`hold_sn_loaded`, `--sn-load-wait`).
+
+`ctx+0x142fc` is also the room's lock, and nothing used to lower it. The guest
+room's input handler (`0x00a4ca6c`) ignores the pad while it is set, its back
+button (`0x00a4d180`) takes another path, and the owner's room
+(`0x00a582b8`) greys its menu items. The owner clears it only on its "guest
+left" path (`0x00a584d0`); `0x4324`, `0x4325`, `0x4331` and sending
+`0x4a00` clear it too. That is why, after every match, both sides sat in a
+room that took no input until someone left and rejoined.
+
+Its real clear is the push **`0x4434`**, `u32` status (parser `0x0026eb30`,
+a plain case of the dispatch at `0x002722bc`): status 0 zeroes the flag. Each
+player sends `0x4432` on leaving the result screen, and the server pushes
+`0x4434` after the `0x4433` reply (`unlock_sn_room`, `--sn-keep-room-lock`
+to compare).
 
 #### The result: `0x4431` decides who won
 
